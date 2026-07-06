@@ -3,8 +3,8 @@ the references store for audit but are barred from the review body
 (`lint_review.py` / `render_refs.py` both fail if an excluded key is cited).
 
 Usage:
-    python scripts/exclude.py reviews/<topic> DOI "reason text"
-    python scripts/exclude.py reviews/<topic> DOI --include   # remove exclusion
+    python tools/exclude.py reviews/<topic> DOI "reason text"
+    python tools/exclude.py reviews/<topic> DOI --include   # remove exclusion
 
 The reason is logged at the end of `research_log.md` so the audit trail is
 visible without grepping JSON.

@@ -21,6 +21,7 @@ If a target file already exists the tool refuses to overwrite unless
 from __future__ import annotations
 
 import argparse
+import json
 import pathlib
 import sys
 
@@ -131,6 +132,32 @@ def _write_gap_file(
     header = "\n".join(header_lines) + "\n"
     body = "\n".join(_entry_section(e, _read_abstract(e)) for e in entries)
     output_path.write_text(header + body, encoding="utf-8")
+
+
+def _gap_compact_records(entries: list[refs.Entry]) -> list[dict[str, object]]:
+    """plan v3 §3.3 C14: lean per-entry records for the analyst — the data it
+    actually judges on (title / abstract / study_type / grounding / key), with
+    none of the markdown scaffolding (### headers, repeated labels) that bloats
+    the analyst's cache_read. The companion .md stays for human reading."""
+    return [
+        {
+            "key": entry.get("citation_key"),
+            "doi": entry.get("doi"),
+            "title": entry.get("title", ""),
+            "year": entry.get("year"),
+            "study_type": entry.get("study_type", "other"),
+            "grounding": refs.grounding(entry),
+            "abstract": _read_abstract(entry),
+        }
+        for entry in entries
+    ]
+
+
+def _write_gap_compact(output_path: pathlib.Path, entries: list[refs.Entry]) -> None:
+    """Write the C14 compact analyst payload as JSONL (one record per line)."""
+    records = _gap_compact_records(entries)
+    body = "\n".join(json.dumps(rec, ensure_ascii=False) for rec in records)
+    output_path.write_text(body + ("\n" if body else ""), encoding="utf-8")
 
 
 def _write_round_index(
@@ -302,6 +329,8 @@ def main() -> None:
                 description,
                 entries,
             )
+            # C14 companion: lean JSONL payload for the analyst subagent.
+            _write_gap_compact(round_dir / f"{gap_id}.compact.jsonl", entries)
             gap_summaries.append((gap_id, description, len(entries), gap_path))
             total_entries += len(entries)
             print(f"[OK] wrote {gap_path} ({len(entries)} entries)")

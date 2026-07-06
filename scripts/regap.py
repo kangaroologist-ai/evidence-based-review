@@ -3,8 +3,8 @@ gap (gap-3) but on rereading better fits another (gap-4). `refs.upsert`
 preserves the first-seen gap on purpose; this CLI is the deliberate override.
 
 Usage:
-    python scripts/regap.py reviews/<topic> DOI gap-N
-    python scripts/regap.py reviews/<topic> DOI --clear   # detach from any gap
+    python tools/regap.py reviews/<topic> DOI gap-N
+    python tools/regap.py reviews/<topic> DOI --clear   # detach from any gap
 
 Refuses to set a gap that has not been declared in the store. Appends to
 `research_log.md` for an audit trail.
@@ -12,6 +12,7 @@ Refuses to set a gap that has not been declared in the store. Appends to
 from __future__ import annotations
 
 import argparse
+import difflib
 import pathlib
 import sys
 from datetime import datetime
@@ -20,6 +21,41 @@ sys.path.insert(0, str(pathlib.Path(__file__).parent))
 
 from lib import testflight
 import refs
+
+
+def closest_gaps(target: str, store: refs.Store, *, n: int = 3, cutoff: float = 0.4) -> list[str]:
+    """plan v3 B2: fuzzy-match a (possibly hallucinated) gap label against the
+    declared gap ids AND their descriptions; return up to ``n`` candidate gap
+    ids best matching ``target``. Empty when nothing is close — the caller must
+    then refuse rather than silently mis-attach."""
+    gaps = store.get("gaps", {})
+    if not gaps:
+        return []
+    ids = list(gaps)
+    ordered: list[str] = []
+    for gid in difflib.get_close_matches(target, ids, n=n, cutoff=cutoff):
+        if gid not in ordered:
+            ordered.append(gid)
+    # also match against descriptions, mapping back to the gap id
+    desc_to_id = {
+        (g.get("description") or ""): gid
+        for gid, g in gaps.items()
+        if isinstance(g, dict) and g.get("description")
+    }
+    for desc in difflib.get_close_matches(target, list(desc_to_id), n=n, cutoff=cutoff):
+        gid = desc_to_id[desc]
+        if gid not in ordered:
+            ordered.append(gid)
+    return ordered[:n]
+
+
+def best_gap(target: str, store: refs.Store, *, cutoff: float = 0.8) -> str | None:
+    """Single confident gap-id match for ``target`` (high cutoff), or None.
+    Used by --accept-closest so a near-perfect typo auto-resolves while
+    prefix-sharing siblings (which the loose closest_gaps() surfaces) do not."""
+    ids = list(store.get("gaps", {}))
+    matches = difflib.get_close_matches(target, ids, n=1, cutoff=cutoff)
+    return matches[0] if matches else None
 
 
 def _append_log(topic_dir: pathlib.Path, doi: str, before: str | None, after: str | None) -> None:
@@ -42,6 +78,12 @@ def main() -> None:
         "--clear",
         action="store_true",
         help="Detach the entry from any gap (sets gap=None).",
+    )
+    parser.add_argument(
+        "--accept-closest",
+        action="store_true",
+        help="If new_gap is undeclared, apply the single best fuzzy-matched "
+        "declared gap instead of erroring (B2). Refuses if 0 or >1 candidates.",
     )
     args = parser.parse_args()
 
@@ -67,8 +109,23 @@ def main() -> None:
 
         new_gap = None if args.clear else args.new_gap
         if new_gap is not None and new_gap not in store.get("gaps", {}):
-            print(f"[ERROR] gap not declared: {new_gap}")
-            raise SystemExit(1)
+            confident = best_gap(new_gap, store) if args.accept_closest else None
+            if confident is not None:
+                print(f"[OK] --accept-closest: '{new_gap}' → {confident}")
+                new_gap = confident
+            else:
+                candidates = closest_gaps(new_gap, store)
+                print(f"[ERROR] gap not declared: {new_gap}")
+                if candidates:
+                    declared = store.get("gaps", {})
+                    hints = ", ".join(
+                        f"{gid} ({(declared.get(gid, {}).get('description') or '')[:40]})"
+                        for gid in candidates
+                    )
+                    print(f"  did you mean: {hints}")
+                    print("  (pass --accept-closest to apply when there is a single match,")
+                    print("   or declare the gap / pick the right id — never silently mis-attach)")
+                raise SystemExit(1)
 
         before = entry.get("gap")
         refs.set_gap(store, doi, new_gap)

@@ -9,6 +9,10 @@ term_check_overrides:
   require_rct_or_meta: true
   require_primary_evidence_per_gap: 1
 default_search_sources: [crossref, semantic_scholar]
+protocol_defaults:
+  inclusion: "学习者/课堂/教师研究：meta、(cluster) RCT/准实验、大型纵向队列、PER 与教育心理实证、WWC/AERA/APA handbook；中英文（CNKI 需手供标识）"
+  exclusion: "纯思辨/政策评论无实证、单一轶事课堂报告、无效度的自编量表"
+  outcomes: "以学习/发展结局为准（成绩、迁移、动机、概念转变；效应量 d/g/Hedges）"
 ---
 
 # 主题补丁 — 教育 / 学习科学 / 发展与教育心理学

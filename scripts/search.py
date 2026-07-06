@@ -5,11 +5,13 @@ import pathlib
 import re
 import shlex
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 
 sys.path.insert(0, str(pathlib.Path(__file__).parent))
 
-from lib import apis, testflight
+from lib import apis, cli_runtime, testflight
+from lib.extra_sources import search_extra
 import refs
 
 SEMANTIC_SCHOLAR_BASE = "https://api.semanticscholar.org/graph/v1"
@@ -101,6 +103,51 @@ class SearchHit:
     first_author_family: str
     cited_by_count: int
     publication_type: str
+
+
+_RRF_K = 60
+
+
+def _rank_candidates(
+    hits: list[SearchHit],
+    *,
+    mode: str,
+    cr_order: list[str] | None = None,
+    sm_order: list[str] | None = None,
+) -> list[SearchHit]:
+    """Re-order merged candidates (see docs/research_tooling.md §3).
+
+    ``rrf`` (default, Reciprocal Rank Fusion) fuses the two source rankings by
+    *position* only: a paper ranked high by BOTH CrossRef and Semantic Scholar
+    is boosted above one-source noise, and because it ignores absolute citation
+    counts, brand-new papers are not penalised. Single-source results have only
+    one ranking, so ``rrf`` ≡ ``relevance`` there (no-op short-circuit).
+    ``cited`` / ``year`` sort by the corresponding ``SearchHit`` field;
+    ``relevance`` keeps the existing merge order."""
+    if mode == "relevance" or not hits:
+        return hits
+    if mode == "cited":
+        return sorted(hits, key=lambda h: h.cited_by_count, reverse=True)
+    if mode == "year":
+        return sorted(hits, key=lambda h: h.year, reverse=True)
+    # rrf — needs both source orderings; with one source it degenerates to the
+    # existing relevance order, so short-circuit (keeps single-source default safe).
+    if not cr_order or not sm_order:
+        return hits
+    cr_rank = {doi.lower(): i for i, doi in enumerate(cr_order)}
+    sm_rank = {doi.lower(): i for i, doi in enumerate(sm_order)}
+
+    def _rrf_score(hit: SearchHit) -> float:
+        key = hit.doi.lower()
+        score = 0.0
+        if key in cr_rank:
+            score += 1.0 / (_RRF_K + cr_rank[key])
+        if key in sm_rank:
+            score += 1.0 / (_RRF_K + sm_rank[key])
+        return score
+
+    # Stable sort preserves merge order within equal scores.
+    return sorted(hits, key=_rrf_score, reverse=True)
 
 
 def _as_dict(value: object) -> dict[str, object] | None:
@@ -293,6 +340,51 @@ def _search_semantic_scholar(
     return hits
 
 
+def _both_sources_parallel(
+    query: str,
+    *,
+    rows: int,
+    year_from: int | None,
+    year_to: int | None,
+    type_filter: str | None,
+) -> tuple[list[SearchHit], list[SearchHit], list[str]]:
+    """F7 (plan §8.2): run CrossRef + Semantic Scholar concurrently instead of
+    back-to-back. They hit distinct hosts (HostGate-isolated, thread-safe — same
+    threading model genealogy/fetch --parallel already use), so the two network
+    round-trips overlap. A source that raises is isolated to [] so the other's
+    hits survive — strictly more robust than the old sequential path, where an
+    exception in either backend aborted the whole --source both search.
+
+    Returns (crossref_hits, semantic_hits, failed_sources). failed_sources lists
+    the labels whose backend raised (each isolated to []), so the caller can
+    surface a DEGRADED both-source run (e.g. record it in detail[]) instead of
+    silently treating half-coverage as full — an --auto-add run must not proceed
+    on one-source results believing it had both. merge/dedup/rank unchanged."""
+    failed: list[str] = []
+
+    def _safe(fn, label: str) -> list[SearchHit]:
+        try:
+            return fn()
+        except Exception as exc:  # noqa: BLE001 — one backend must not sink the other
+            print(f"[WARN] search source {label} failed: {exc}", file=sys.stderr)
+            failed.append(label)  # list.append is atomic under the GIL; ≤1/thread
+            return []
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        cr_future = pool.submit(
+            _safe,
+            lambda: _search_crossref(query, rows, year_from, year_to, type_filter),
+            "crossref",
+        )
+        sm_future = pool.submit(
+            _safe,
+            lambda: _search_semantic_scholar(query, rows, year_from, year_to),
+            "semantic",
+        )
+        cr_hits, sm_hits = cr_future.result(), sm_future.result()
+    return cr_hits, sm_hits, sorted(failed)
+
+
 def _match_semantic_scholar(query: str) -> list[SearchHit]:
     params: apis.QueryParams = {
         "query": query,
@@ -342,6 +434,31 @@ def _print_hits(hits: list[SearchHit], *, topic_dir: str, round_number: int) -> 
         print(f"    add: {_add_command(topic_dir, hit, round_number)}")
 
 
+def _emit_batch(
+    hits: list[SearchHit], out_path: pathlib.Path, *, gap_id: str | None
+) -> int:
+    """Write hits as a TSV candidate file for ``verify.py --add-batch``: one
+    ``DOI<TAB>TITLE<TAB>YEAR<TAB>AUTHORS<TAB>GAP`` row per hit (authors joined
+    by '; '). Closes the discovery-first loop: search → emit-batch → eyeball &
+    delete rows → ``verify --add-batch``. The reader ignores blank and
+    ``#``-prefixed lines; a header comment documents the columns."""
+
+    def _clean(text: str) -> str:
+        return text.replace("\t", " ").replace("\n", " ").strip()
+
+    lines = [
+        "# DOI\tTITLE\tYEAR\tAUTHORS\tGAP  — delete unwanted rows, then:",
+        "# python tools/verify.py <topic> --add-batch <this-file> --source search --round R",
+    ]
+    for hit in hits:
+        authors = "; ".join(hit.authors)
+        lines.append(
+            f"{hit.doi}\t{_clean(hit.title)}\t{hit.year}\t{_clean(authors)}\t{gap_id or ''}"
+        )
+    out_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return len(hits)
+
+
 def _gap_declared(topic_dir: pathlib.Path, gap_id: str) -> bool:
     store = refs.load(topic_dir)
     return store is not None and gap_id in store.get("gaps", {})
@@ -380,9 +497,18 @@ def _auto_add(
     store = refs.load(topic_dir)
     added = 0
     skipped_excluded = 0
+    skipped_nodoi = 0
     for hit in hits:
         if max_add and added >= max_add:
             break
+        # R6 (C8 noise gate): clinical-trial hits carry doi="nct:<NCTId>" and
+        # other extra sources can lack a DOI — neither is verify-able, so don't
+        # auto-add them as pending (they'd just fail verify and clutter the store).
+        doi = (hit.doi or "").strip()
+        if not doi or doi.lower().startswith("nct:"):
+            skipped_nodoi += 1
+            print(f"[SKIP] no verifiable DOI (nct/empty): {hit.doi!r}", file=sys.stderr)
+            continue
         if store is not None and refs.is_excluded(store, hit.doi):
             skipped_excluded += 1
             print(f"[SKIP] previously-excluded: {hit.doi}", file=sys.stderr)
@@ -402,6 +528,12 @@ def _auto_add(
         )
         added += 1
         print(f"[ADDED] {hit.doi}")
+    if skipped_nodoi:
+        print(
+            f"[auto-add] skipped {skipped_nodoi} hit(s) with no verifiable DOI "
+            "(nct/empty) — R6 noise gate",
+            file=sys.stderr,
+        )
     return added, skipped_excluded
 
 
@@ -423,7 +555,7 @@ def main() -> None:
     parser.add_argument("--type", dest="type_filter")
     parser.add_argument(
         "--source",
-        choices=["crossref", "semantic", "both"],
+        choices=["crossref", "semantic", "both", "pubmed", "biorxiv", "clinicaltrials", "all"],
         default="both",
         help=(
             "Search backend. both = crossref + semantic merge dedup "
@@ -450,6 +582,22 @@ def main() -> None:
     )
     parser.add_argument("--gap")
     parser.add_argument("--round", dest="round_number", type=int, default=1)
+    parser.add_argument(
+        "--rank",
+        choices=["relevance", "rrf", "cited", "year"],
+        default="rrf",
+        help="Ordering of --source both results. rrf (default) = Reciprocal "
+        "Rank Fusion of the CrossRef + Semantic rankings (two-source consensus "
+        "on top, new papers not penalised by low citation counts); relevance = "
+        "legacy merge order; cited / year = sort by citations / recency. "
+        "Single-source: rrf == relevance. See docs/research_tooling.md §3.",
+    )
+    parser.add_argument(
+        "--emit-batch",
+        help="Write candidates as a TSV (DOI/TITLE/YEAR/AUTHORS/GAP) to this "
+        "path instead of auto-adding; edit it (delete rows), then feed to "
+        "`verify.py --add-batch`. Mutually exclusive with --auto-add.",
+    )
     args = parser.parse_args()
 
     # --type is a CrossRef-only filter. Under --source both (the default),
@@ -463,6 +611,15 @@ def main() -> None:
             f"{'match' if args.match else args.source}, the type filter "
             "only applies to CrossRef hits while other-source results "
             "pass through unfiltered. Switch --source crossref or drop --type."
+        )
+        raise SystemExit(1)
+
+    if args.emit_batch and args.auto_add:
+        print(
+            "[ERROR] --emit-batch and --auto-add are mutually exclusive: "
+            "emit-batch writes candidates to a file for review then "
+            "`verify --add-batch`; auto-add writes straight to the store.",
+            file=sys.stderr,
         )
         raise SystemExit(1)
 
@@ -495,7 +652,7 @@ def main() -> None:
         ):
             print(
                 f"[ERROR] gap '{args.gap}' not declared in {args.auto_add} — "
-                f"run `python scripts/verify.py {shlex.quote(str(args.auto_add))} "
+                f"run `python tools/verify.py {shlex.quote(str(args.auto_add))} "
                 f"--declare-gap {args.gap} '<description>' "
                 f"--round {args.round_number}` first.",
                 file=sys.stderr,
@@ -509,7 +666,7 @@ def main() -> None:
             print(
                 f"[HINT] gap '{args.gap}' has no source=seed entry yet — "
                 "consider seeding known landmark DOIs first "
-                f"(`python scripts/verify.py {shlex.quote(str(args.auto_add))} "
+                f"(`python tools/verify.py {shlex.quote(str(args.auto_add))} "
                 f"--add DOI TITLE YEAR AUTHORS --gap {args.gap} "
                 "--source seed`), then search to fill the gaps. seed → search "
                 "→ genealogy keeps the candidate pool clean.",
@@ -524,6 +681,8 @@ def main() -> None:
         rows=args.rows,
         gap=args.gap,
     ) as detail:
+        cr_order: list[str] | None = None
+        sm_order: list[str] | None = None
         if args.match:
             hits = _match_semantic_scholar(query)
         elif args.source == "semantic":
@@ -541,26 +700,67 @@ def main() -> None:
                 year_to=args.year_to,
                 type_filter=args.type_filter,
             )
-        else:  # both — default; merge dedup by DOI
-            cr_hits = _search_crossref(
+        elif args.source in ("pubmed", "biorxiv", "clinicaltrials"):
+            # plan v3 C8 / A4:免认证 REST 多源（每源失败优雅降级回 []）。
+            hits = search_extra(query, args.rows, [args.source])
+        elif args.source == "all":
+            # crossref + semantic (并发) ∪ pubmed/biorxiv/clinicaltrials（新 DOI 追加）。
+            cr_hits, sm_hits, source_failures = _both_sources_parallel(
                 query,
                 rows=args.rows,
                 year_from=args.year_from,
                 year_to=args.year_to,
                 type_filter=args.type_filter,
             )
-            sm_hits = _search_semantic_scholar(
+            hits = _merge_dedup(cr_hits, sm_hits)
+            cr_order = [h.doi for h in cr_hits]
+            sm_order = [h.doi for h in sm_hits]
+            detail["crossref_hits"] = len(cr_hits)
+            detail["semantic_hits"] = len(sm_hits)
+            if source_failures:
+                detail["source_failures"] = source_failures
+            extra_hits = search_extra(
+                query, args.rows, ["pubmed", "biorxiv", "clinicaltrials"]
+            )
+            seen_dois = {h.doi.lower() for h in hits}
+            for h in extra_hits:
+                if h.doi.lower() not in seen_dois:
+                    hits.append(h)
+                    seen_dois.add(h.doi.lower())
+            detail["extra_hits"] = len(extra_hits)
+        else:  # both — default; merge dedup by DOI
+            cr_hits, sm_hits, source_failures = _both_sources_parallel(
                 query,
                 rows=args.rows,
                 year_from=args.year_from,
                 year_to=args.year_to,
+                type_filter=args.type_filter,
             )
             hits = _merge_dedup(cr_hits, sm_hits)
+            cr_order = [h.doi for h in cr_hits]
+            sm_order = [h.doi for h in sm_hits]
             detail["crossref_hits"] = len(cr_hits)
             detail["semantic_hits"] = len(sm_hits)
+            # F7: surface a degraded both-source run so downstream (e.g. auto-add)
+            # doesn't silently treat one-source coverage as full both-source.
+            if source_failures:
+                detail["source_failures"] = source_failures
+        if not args.match:
+            hits = _rank_candidates(
+                hits, mode=args.rank, cr_order=cr_order, sm_order=sm_order
+            )
+        detail["rank"] = "match" if args.match else args.rank
         topic_dir_label = args.auto_add or "TOPIC_DIR"
         _print_hits(hits, topic_dir=topic_dir_label, round_number=args.round_number)
         detail["hits"] = len(hits)
+
+        if args.emit_batch:
+            emitted = _emit_batch(
+                hits, pathlib.Path(args.emit_batch), gap_id=args.gap
+            )
+            detail["emitted"] = emitted
+            print(f"emitted {emitted} candidates → {args.emit_batch}")
+            return
 
         if args.auto_add and topic_dir is not None:
             added, skipped_excluded = _auto_add(
@@ -580,5 +780,13 @@ def main() -> None:
         print(f"{len(hits)} results")
 
 
+def run(argv: list[str], cwd: str | None = None, env: dict[str, str] | None = None) -> int:
+    """In-process entry for the daemon (E3) / tests; wraps main() via
+    cli_runtime so the exit-code contract matches the standalone CLI."""
+    return cli_runtime.invoke(main, argv, prog="search.py", cwd=cwd, env=env)
+
+
 if __name__ == "__main__":
-    main()
+    from lib import daemon
+
+    raise SystemExit(daemon.cli_entry("search", main))

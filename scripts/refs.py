@@ -13,7 +13,7 @@ from datetime import date, datetime, timezone
 from collections.abc import Callable, Iterator
 from typing import Literal, TypedDict, cast
 
-from lib import project
+from lib import liveness, project
 
 FetchStatus = Literal["pending", "succeeded", "failed", "skipped"]
 VerificationStatus = Literal["pending", "verified", "failed"]
@@ -73,12 +73,16 @@ class FetchState(TypedDict, total=False):
     tables: FetchStatus
     pdf: FetchStatus
     pdf_text: FetchStatus
+    # plan v3 §3.4 C19: OCR rung (MinerU) for scanned/image-only PDFs whose
+    # born-digital text extraction (pdf_text via PyMuPDF) came back empty.
+    ocr: FetchStatus
 
 
 class Paths(TypedDict, total=False):
     abstract: str | None
     pdf: str | None
     pdf_text: str | None
+    ocr: str | None
 
 
 class JournalSignals(TypedDict, total=False):
@@ -101,6 +105,8 @@ class Gap(TypedDict, total=False):
     fields: dict[str, object]  # P-I-C-O / Phenomenon-Mechanism / etc. by type
     depends_on: list[str]      # gap ids this one depends on (topological order)
     subgap_of: str | None      # parent gap id (e.g. gap-3 for gap-3.1)
+    query: str | None              # spec N2: English/optimized search query for the round
+    relevance_terms: str | None    # spec N2: terms for the C2 relevance gate / genealogy
 
 
 class Entry(TypedDict, total=False):
@@ -109,6 +115,7 @@ class Entry(TypedDict, total=False):
     authors: list[str]
     year: int
     journal: str
+    issn: list[str]
     source: str
     added_round: int
     overlap: int
@@ -126,6 +133,12 @@ class Entry(TypedDict, total=False):
     superseded_by: str | None
     supersedes: list[str]
     excluded_reason: str | None
+    # plan v3 §2 C6 (A1): on-topic, real evidence the analyst deliberately keeps
+    # in the store but does not expect to cite (not the strongest support for any
+    # proposition). Stays verified + citable, but is excluded from the cited-ratio
+    # denominator so breadth doesn't trigger a FAIL that forces deleting read
+    # literature. Distinct from excluded_reason (cross-domain noise → dropped).
+    keep_uncited: bool
     fetch_state: FetchState
     paths: Paths
     asset_ids: list[str]
@@ -140,6 +153,10 @@ class StoreMeta(TypedDict, total=False):
     # evidence base, default search sources, lint thresholds). Defaults to
     # "health" — the implicit baseline declared in CLAUDE.md.
     domain: str
+    # Rounds declared as targeted addenda to an already-saturated topic
+    # (verify --declare-gap --addendum). Consumed by term_check to relax
+    # round-bookkeeping. MUST be preserved by _store_meta across save().
+    addendum_rounds: list[int]
 
 
 class Store(StoreMeta, total=False):
@@ -168,7 +185,131 @@ def _default_fetch_state() -> FetchState:
 
 
 def _default_paths() -> Paths:
-    return {"abstract": None, "pdf": None, "pdf_text": None}
+    return {"abstract": None, "pdf": None, "pdf_text": None, "ocr": None}
+
+
+GroundingLevel = Literal["fulltext", "pdf_text", "ocr", "abstract", "title_only"]
+
+
+def grounding(entry: "Entry") -> GroundingLevel:
+    """Best readable-content level available for ``entry`` (plan v3 §3.4 C16).
+
+    Derived from fetch_state/paths rather than stored, so it can never drift.
+    Precedence by content richness: fulltext > pdf_text (born-digital) > ocr >
+    abstract > title_only. ``title_only`` means we have only metadata (title /
+    authors / year) — the analyst and faithfulness have no text to ground on.
+    """
+    fetch_state = entry.get("fetch_state") or {}
+    paths = entry.get("paths") or {}
+    # INVARIANT: a content-bearing level MUST be backed by readable text we actually
+    # persisted, or grounding() and faithfulness._load_source_text() disagree — the
+    # latter returns '' and every citing claim is marked `insufficient` (a hard
+    # write_gate FAIL) while grounding() still advertises "fulltext". Fulltext XML is
+    # never saved to its own path; its readable form is the enriched abstract card
+    # (paths['abstract'], carrying intro+conclusion). So fulltext_xml=='succeeded' /
+    # has_fulltext_xml only attest the XML was AVAILABLE at fetch time — when EuPMC's
+    # abstractText and CrossRef's abstract are both empty the card is skipped and the
+    # content dropped, leaving the flag set with no persisted text. Gate every content
+    # level on a real readable path (pdf_text / ocr / abstract — the same paths
+    # _load_source_text reads); the honest worst case is "title_only".
+    readable = paths.get("pdf_text") or paths.get("ocr") or paths.get("abstract")
+    if (fetch_state.get("fulltext_xml") == "succeeded" or entry.get("has_fulltext_xml")) and readable:
+        return "fulltext"
+    if paths.get("pdf_text"):
+        return "pdf_text"
+    if (fetch_state.get("ocr") == "succeeded" or paths.get("ocr")) and (
+        paths.get("ocr") or paths.get("abstract")
+    ):
+        return "ocr"
+    if paths.get("abstract"):
+        return "abstract"
+    return "title_only"
+
+
+def is_grounded(entry: "Entry") -> bool:
+    """True iff the entry has any readable content (not title-only)."""
+    return grounding(entry) != "title_only"
+
+
+_PREPRINT_JOURNAL_RE = re.compile(
+    r"biorxiv|medrxiv|arxiv|research\s*square|preprint|ssrn|chemrxiv|psyarxiv|osf",
+    re.IGNORECASE,
+)
+
+
+def metadata_flags(entry: "Entry") -> dict[str, bool]:
+    """Normalized publication-integrity flags (plan v3.1 M1 / spec §0.6 元数据闸).
+
+    Derived deterministically from already-stored fields — ``retracted`` plus
+    ``verification.corrections`` (CrossRef update-to: correction / EoC, persisted
+    by verify) plus the journal name (preprint servers). No network. These are the
+    spec status fields retraction/erratum/expression_of_concern/preprint_status;
+    duplicate_cluster_id is study-level dedup (spec §7, out of scope)."""
+    verification = entry.get("verification") or {}
+    corrections = [str(c).lower() for c in (verification.get("corrections") or [])]
+    journal = str(entry.get("journal") or "")
+    return {
+        "retracted": bool(entry.get("retracted")),
+        "expression_of_concern": any("concern" in c for c in corrections),
+        "erratum": any(c in ("correction", "erratum", "corrigendum") for c in corrections),
+        "preprint": bool(_PREPRINT_JOURNAL_RE.search(journal)),
+    }
+
+
+def _title_cluster_id(entry: "Entry") -> str | None:
+    """A deterministic cluster id from the normalized title — entries with the same
+    (case/space/punct-normalized) title share an id. A BASIC duplicate signal, not
+    full study-level dedup (that is spec §7); but no longer a fixed None."""
+    import hashlib
+
+    title = str(entry.get("title") or "").lower()
+    norm = re.sub(r"[^a-z0-9一-鿿]", "", title)
+    if len(norm) < 6:
+        return None
+    return "t" + hashlib.sha1(norm.encode("utf-8")).hexdigest()[:10]
+
+
+def metadata_status_fields(entry: "Entry") -> dict[str, object]:
+    """The spec §2 verify --add OUT *persisted* status fields (plan v3.1 M1), built
+    from metadata_flags. ``duplicate_cluster_id`` is a normalized-title cluster (a
+    basic dup signal; full study-level dedup is spec §7)."""
+    flags = metadata_flags(entry)
+    return {
+        "retraction_status": "retracted" if flags["retracted"] else "none",
+        "erratum_status": "corrected" if flags["erratum"] else "none",
+        "expression_of_concern": flags["expression_of_concern"],
+        "preprint_status": "preprint" if flags["preprint"] else "published",
+        "duplicate_cluster_id": _title_cluster_id(entry),
+    }
+
+
+# The grounding escalation ladder (plan v3 §3.4 C15): cheapest rung first.
+_GROUNDING_LADDER: tuple[tuple[str, str], ...] = (
+    ("abstract", "abstract"),       # fetch --include abstract (EuPMC→CrossRef)
+    ("fulltext_xml", "fulltext"),   # fetch --include fulltext (JATS)
+    ("pdf", "pdf"),                 # fetch --include pdf → extract_pdf (born-digital)
+    ("ocr", "ocr"),                 # MinerU OCR rung (C19), for scanned PDFs
+)
+
+
+def grounding_ladder_next(entry: "Entry") -> str | None:
+    """For an UNgrounded entry, return the next fetch rung to attempt
+    (``abstract`` → ``fulltext`` → ``pdf`` → ``ocr``), or None when the entry is
+    already grounded OR every rung has been tried (the irreducible title-only
+    residual that must be accepted, not looped on — plan v3 §3.4 C15/C18).
+
+    "Tried" = its fetch_state is succeeded/failed/skipped; a ``pending`` rung is
+    the next thing to attempt. Callers escalate LAZILY (only for entries a gap
+    actually needs — C10), never the whole store, to keep OCR/PDF cost bounded.
+    """
+    if is_grounded(entry):
+        return None
+    fetch_state = entry.get("fetch_state") or {}
+    tried = {"succeeded", "failed", "skipped"}
+    for state_key, include_name in _GROUNDING_LADDER:
+        if fetch_state.get(state_key) not in tried:
+            return include_name
+    return None
 
 
 def _default_verification() -> Verification:
@@ -225,6 +366,8 @@ def _normalize_gap(value: object) -> Gap:
             "fields": {},
             "depends_on": [],
             "subgap_of": None,
+            "query": None,
+            "relevance_terms": None,
         }
 
     description = value.get("description")
@@ -233,6 +376,8 @@ def _normalize_gap(value: object) -> Gap:
     fields_raw = value.get("fields")
     depends_on_raw = value.get("depends_on")
     subgap_of_raw = value.get("subgap_of")
+    query_raw = value.get("query")
+    relevance_raw = value.get("relevance_terms")
     return {
         "description": description if isinstance(description, str) else "",
         "status": _normalize_gap_status(value.get("status")),
@@ -243,6 +388,9 @@ def _normalize_gap(value: object) -> Gap:
         "fields": fields_raw if isinstance(fields_raw, dict) else {},
         "depends_on": [g for g in (depends_on_raw or []) if isinstance(g, str)],
         "subgap_of": subgap_of_raw if isinstance(subgap_of_raw, str) else None,
+        # spec N2: persisted per-gap search query + relevance terms (R-testflight)
+        "query": query_raw if isinstance(query_raw, str) and query_raw.strip() else None,
+        "relevance_terms": relevance_raw if isinstance(relevance_raw, str) and relevance_raw.strip() else None,
     }
 
 
@@ -447,6 +595,7 @@ def _ensure_defaults(entry: Entry) -> Entry:
     elif "year" in entry:
         del entry["year"]
     entry["journal"] = _normalize_str(entry.get("journal"))
+    entry["issn"] = _normalize_str_list(entry.get("issn"))
     entry["source"] = _normalize_str(entry.get("source"))
     added_round = entry.get("added_round")
     if isinstance(added_round, int):
@@ -553,13 +702,27 @@ def _lock_path(file_path: pathlib.Path) -> pathlib.Path:
 
 def _store_meta(store: Store) -> StoreMeta:
     ensured = _ensure_store_defaults(cast(Store, dict(store)))
-    return {
+    meta: StoreMeta = {
         "topic": ensured["topic"],
         "created": ensured["created"],
         "rounds": ensured["rounds"],
         "gaps": ensured["gaps"],
         "domain": ensured.get("domain", "health"),
     }
+    # addendum_rounds is outside the base whitelist above; without this
+    # passthrough any save() silently drops it and breaks term_check's
+    # addendum handling (declare_gap writes it, term_check.py reads it).
+    addendum_rounds = ensured.get("addendum_rounds")
+    if addendum_rounds:
+        meta["addendum_rounds"] = list(addendum_rounds)
+    # round_meta (F6, testflight #2): per-round genealogy cap-hit flags so
+    # term_check can reject cap-throttled rounds from the saturation window — a
+    # tight --max-add must not fake saturation. Same passthrough rationale as
+    # addendum_rounds: outside the base whitelist above, silently dropped without it.
+    round_meta = ensured.get("round_meta")
+    if round_meta:
+        meta["round_meta"] = dict(round_meta)
+    return meta
 
 
 def _read_json_file(file_path: pathlib.Path) -> object:
@@ -670,6 +833,11 @@ def latest_round(store: Store) -> int:
 
 
 def save(topic_dir: str | pathlib.Path, data: Store) -> None:
+    # C12: a daemon-routed tool whose client vanished mid-run must NOT commit a
+    # half-applied store. ensure_alive() raises ClientGone (caught by the daemon
+    # dispatcher → exit 2, no write) before any file is touched. Outside the daemon
+    # no probe is registered → this is a no-op.
+    liveness.ensure_alive()
     topic_path = pathlib.Path(topic_dir)
     store = _ensure_store_defaults(cast(Store, dict(data)), topic_path.name)
     data["topic"] = store["topic"]
@@ -839,6 +1007,8 @@ def declare_gap(
     fields: dict[str, object] | None = None,
     depends_on: list[str] | None = None,
     subgap_of: str | None = None,
+    query: str | None = None,
+    relevance_terms: str | None = None,
     addendum: bool = False,
 ) -> bool:
     """Idempotent declare. If the gap already exists, update mutable
@@ -868,6 +1038,18 @@ def declare_gap(
             existing["depends_on"] = normalized_deps
         if subgap_of is not None:
             existing["subgap_of"] = subgap_of if subgap_of else None
+        # spec N2 schema: a per-gap search `query` (English/optimized) + `relevance_terms` for the
+        # C2 gate / genealogy. Persisted (not just transient workflow args) so a resume / fallback
+        # runner doesn't lose them and fall back to the CJK description as the search query.
+        if query is not None:
+            existing["query"] = query.strip() or None
+        if relevance_terms is not None:
+            existing["relevance_terms"] = relevance_terms.strip() or None
+        if addendum:
+            existing["addendum"] = True
+            rounds = store.setdefault("addendum_rounds", [])
+            if round_number not in rounds:
+                rounds.append(round_number)
         return False
     gaps[gap_id] = {
         "description": description,
@@ -879,6 +1061,8 @@ def declare_gap(
         "fields": normalized_fields,
         "depends_on": normalized_deps,
         "subgap_of": subgap_of if subgap_of else None,
+        "query": (query.strip() or None) if query else None,
+        "relevance_terms": (relevance_terms.strip() or None) if relevance_terms else None,
     }
     if addendum:
         gaps[gap_id]["addendum"] = True
@@ -909,6 +1093,25 @@ def exclude_entry(store: Store, doi: str, reason: str) -> None:
     if entry is None:
         raise KeyError(f"doi not in store: {doi}")
     entry["excluded_reason"] = reason
+
+
+def set_keep_uncited(store: Store, doi: str, value: bool = True) -> None:
+    """Mark/unmark an entry as keep_uncited (plan v3 C6). Raises if absent."""
+    entry = store["entries"].get(doi.lower())
+    if entry is None:
+        raise KeyError(f"doi not in store: {doi}")
+    if value:
+        entry["keep_uncited"] = True
+    else:
+        entry.pop("keep_uncited", None)
+
+
+def resolve_citation_key(store: Store, key: str) -> str | None:
+    """Return the DOI of the entry whose citation_key == ``key``, or None."""
+    for doi, entry in store["entries"].items():
+        if entry.get("citation_key") == key:
+            return doi
+    return None
 
 
 def include_entry(store: Store, doi: str) -> None:

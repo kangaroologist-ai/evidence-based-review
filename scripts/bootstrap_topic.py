@@ -56,9 +56,9 @@ LOG_TEMPLATE = """# {topic} — Research Log
 - **领域 (domain)**: `{domain}`{patch_hint}
 - **目标读者 / 应用场景**: _user 填_——把这条综述会被谁拿去做什么决定写一句
 - **核心问题（一句话）**: _user 填_——这次综述要回答的根问题
-- **纳入标准 (inclusion criteria)**: _user 填_——研究类型 / 人群 / 时段 / 语言 / 出版形式
-- **排除标准 (exclusion criteria)**: _user 填_——明确不收什么（避免事后调整）
-- **核心 outcomes / 度量**: _user 填_——本综述据此判定有效或差异的指标
+- **纳入标准 (inclusion criteria)**: {inclusion}
+- **排除标准 (exclusion criteria)**: {exclusion}
+- **核心 outcomes / 度量**: {outcomes}
 - **检索源声明**: 默认 `{default_sources}`；如手工补 CNKI / arXiv / 灰文献，此处声明
 - **一级证据扩展**: 见 `patches/{domain}.md` frontmatter（{patch_note}）
 - **综述类型定位**: narrative + decision + mechanism 复合型，按需含 methodology 切面（项目默认）
@@ -125,6 +125,12 @@ def main() -> None:
     parser.add_argument("--force", action="store_true")
     args = parser.parse_args()
 
+    # Bootstrap takes a bare topic NAME. Strip a leading reviews/ (possibly
+    # repeated) a user may paste, so we never create a nested reviews/reviews/<topic>.
+    args.topic = args.topic.strip().strip("/")
+    while args.topic.startswith("reviews/"):
+        args.topic = args.topic[len("reviews/"):]
+
     topic_root = project.topic_dir(args.topic)
     tmp_root = project.topic_tmp(args.topic)
     review_path = project.review_path(topic_root)
@@ -148,12 +154,28 @@ def main() -> None:
         patch_hint = f"（loaded from `{_rel}`）"
         patch_note = "primary / secondary / not_applicable 在 frontmatter 中"
 
+    # Prefill the domain-stable protocol prose from patch frontmatter
+    # (patches.<domain> protocol_defaults). A missing key falls back to the
+    # `_user 填_` placeholder so lint still WARNs when a domain has no default.
+    proto = patch.get("protocol_defaults", {}) or {}
+
+    def _proto(key: str, fallback: str) -> str:
+        value = proto.get(key)
+        if isinstance(value, str) and value.strip():
+            return f"{value.strip()} _（{args.domain} 域默认，按主题微调）_"
+        return fallback
+
     log_content = LOG_TEMPLATE.format(
         topic=args.topic,
         domain=args.domain,
         patch_hint=patch_hint,
         default_sources=default_sources,
         patch_note=patch_note,
+        inclusion=_proto(
+            "inclusion", "_user 填_——研究类型 / 人群 / 时段 / 语言 / 出版形式"
+        ),
+        exclusion=_proto("exclusion", "_user 填_——明确不收什么（避免事后调整）"),
+        outcomes=_proto("outcomes", "_user 填_——本综述据此判定有效或差异的指标"),
     )
 
     with testflight.timer("bootstrap_topic", "main", topic_dir=topic_root, topic=args.topic):
@@ -187,7 +209,11 @@ def main() -> None:
             "next: "
             f"python scripts/verify.py {topic_root} --declare-gap gap-1 \"<desc>\" "
             "--gap-type decision --population <P> --intervention <I> "
-            "--comparator <C> --outcome <O>"
+            "--comparator <C> --outcome <O> --query \"<english search terms>\""
+        )
+        ref_target = _rel if patch_path is not None else "lib/patches.py DEFAULT_PATCH"
+        print(
+            f"ref: 开题先读 {ref_target} —— 命名规则 / 一级证据扩展 / '大队列'阈值 / 缩写中文对照 / 已知局限"
         )
 
 

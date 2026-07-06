@@ -5,7 +5,7 @@ Read-only counterpart to render_refs.py: runs the same citation / gap checks
 that matches the 轮后取舍 principle in CLAUDE.md.
 
 CLI:
-    python scripts/lint_review.py reviews/<topic>
+    python tools/lint_review.py reviews/<topic>
 
 Exit codes:
     0  — all checks passed, no warnings
@@ -32,7 +32,7 @@ import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).parent))
 
-from lib import config, patches, project, testflight
+from lib import config, patches, testflight
 import refs
 import term_check
 
@@ -100,9 +100,9 @@ CitationOccurrence = tuple[int, str]
 
 
 def _load_review(topic_dir: pathlib.Path) -> str:
-    review_path = project.review_path(topic_dir)
+    review_path = topic_dir / "review.md"
     if not review_path.exists():
-        print(f"[ERROR] {review_path.name} not found under {topic_dir}")
+        print(f"[ERROR] review.md not found under {topic_dir}")
         raise SystemExit(EXIT_FAIL)
     return review_path.read_text(encoding="utf-8")
 
@@ -196,10 +196,17 @@ def _check_cited_ratio(
         print("[INFO] .lint_legacy present; cited-ratio hard gate skipped")
         return []
 
+    # plan v3 C6 (A1): keep_uncited entries are on-topic real evidence the
+    # analyst deliberately retains but does not expect to cite. They stay in the
+    # store (recall preserved) but are excluded from the ratio denominator, so
+    # reading broadly no longer trips the cited-ratio FAIL that forced deleting
+    # read literature. The ratio still catches "strong evidence left uncited".
     eligible: list[refs.Entry] = [
         entry
         for entry in store["entries"].values()
-        if isinstance(entry.get("citation_key"), str) and _is_citable_verified(entry)
+        if isinstance(entry.get("citation_key"), str)
+        and _is_citable_verified(entry)
+        and not entry.get("keep_uncited")
     ]
     if not eligible:
         return []
@@ -294,6 +301,108 @@ def _check_gaps(
         )
 
     return errors
+
+
+# plan v3 §3.3 C7: a declared gap should be ANSWERED in a decision-grade §观点
+# section, not merely name-dropped in 摘要/方法/限定/实操/References. Section
+# titles containing any of these markers are NOT proposition sections.
+_NON_PROPOSITION_SECTION_MARKERS = (
+    "摘要", "abstract", "方法", "method", "参考", "reference",
+    "限定", "争议", "limitation", "实操", "建议", "recommend",
+)
+
+
+def _h2_headers(review_text: str) -> list[tuple[int, str]]:
+    """(offset, title) for each level-2 (## ) heading, in document order."""
+    return [(m.start(), m.group(1).strip()) for m in re.finditer(r"(?m)^##\s+(.+?)\s*$", review_text)]
+
+
+def _is_proposition_section(title: str) -> bool:
+    low = title.lower()
+    return not any(mark in title or mark in low for mark in _NON_PROPOSITION_SECTION_MARKERS)
+
+
+def _section_title_for_offset(headers: list[tuple[int, str]], offset: int) -> str:
+    title = ""
+    for h_off, h_title in headers:
+        if h_off <= offset:
+            title = h_title
+        else:
+            break
+    return title
+
+
+def _check_gap_in_proposition_section(
+    occurrences: list[CitationOccurrence],
+    store: refs.Store,
+    review_text: str,
+) -> list[str]:
+    """WARN (C7) when a declared gap is cited SOMEWHERE but never inside a
+    decision-grade §观点 section — i.e. its evidence only appears in
+    摘要/方法/限定/实操/References. Gaps cited nowhere are already a FAIL in
+    _check_gaps, so this only fires for the "answered off to the side" case."""
+    gaps = store.get("gaps", {})
+    headers = _h2_headers(review_text)
+    if not gaps or not headers:
+        return []
+    key_to_gap = {
+        entry["citation_key"]: entry.get("gap")
+        for entry in store["entries"].values()
+        if isinstance(entry.get("citation_key"), str)
+    }
+    cited_anywhere: set[str] = set()
+    cited_in_proposition: set[str] = set()
+    for offset, key in occurrences:
+        gap_id = key_to_gap.get(key)
+        if not (isinstance(gap_id, str) and gap_id in gaps):
+            continue
+        cited_anywhere.add(gap_id)
+        if _is_proposition_section(_section_title_for_offset(headers, offset)):
+            cited_in_proposition.add(gap_id)
+    return [
+        f"[WARN] gap {gap_id} 的被引证据未落在任何 §观点章节（只见于 "
+        f"摘要/方法/限定/实操/References）——每个 gap 应在某决策性 § 章节答出来 (C7)"
+        for gap_id in sorted(cited_anywhere - cited_in_proposition)
+    ]
+
+
+_NUM_NEAR_KEY_RE = re.compile(r"\d")
+
+
+def _check_title_only_quantitative(
+    occurrences: list[CitationOccurrence],
+    by_key: dict[str, refs.Entry],
+    review_text: str,
+) -> list[str]:
+    """FAIL (C18, lifted by plan v3.1 G4) when a title-only [@key] (no readable
+    source content) sits adjacent to a numeric claim — a title-only entry must
+    not anchor a quantitative statement (its content was never read). This is a
+    grounding/fact-risk problem, so workflow_spec §4 lint-exit policy makes it
+    exit 1, not exit 2. Only fires when grounding is actually tracked (some cited
+    entry is grounded), so pre-fetch stores — everything title-only — don't get
+    blanket noise; `.lint_legacy` stores skip it entirely (caller-gated)."""
+    grounded_seen = any(
+        refs.is_grounded(entry)
+        for entry in by_key.values()
+        if entry.get("verification_status") == "verified"
+    )
+    if not grounded_seen:
+        return []
+    flagged: set[str] = set()
+    for offset, key in occurrences:
+        if key in flagged:
+            continue
+        entry = by_key.get(key)
+        if entry is None or refs.grounding(entry) != "title_only":
+            continue
+        window = review_text[max(0, offset - 40): offset]
+        if _NUM_NEAR_KEY_RE.search(window):
+            flagged.add(key)
+    return [
+        f"[FAIL] title-only 条目 [@{key}] 紧邻量化论断——其正文从未被读取，"
+        "不应支撑具体数字；改抓全文 (C15/C19) 或把数字归到 grounded 来源 (G4/C18)"
+        for key in sorted(flagged)
+    ]
 
 
 def _gap_citation_counts(
@@ -420,6 +529,23 @@ def _check_protocol_filled(topic_dir: pathlib.Path) -> list[str]:
 
 _LIMIT_SECTION_RE = re.compile(r"^#+[^\n]*(?:限定|争议|局限)", re.M)
 _METHOD_SECTION_RE = re.compile(r"^#+[^\n]*(?:方法|methods)", re.M | re.I)
+# W1/W2 disclosure-content cues (plan v3.1 / spec §目标边界 + N7 §方法)
+_COMPROMISE_RE = re.compile(
+    r"非系统综述|快速综述|范围受限|结构化综述|低(?:且)?有界|"
+    r"不是?(?:全面|系统|零)|非「?(?:零|全面)」?",
+    re.IGNORECASE,
+)
+_SEARCH_DATE_RE = re.compile(
+    r"检索日期|检索时间|检索于|检索截止|检索范围.*\d{4}|语言.*限制|年份.*限制|searched\s+on",
+    re.IGNORECASE,
+)
+_INCL_EXCL_RE = re.compile(
+    r"纳排|纳入.*排除|纳入标准|排除标准|inclusion.*exclusion", re.IGNORECASE
+)
+_PRISMA_DISCLAIMER_RE = re.compile(
+    r"非完整\s*PRISMA|非系统综述|不是?\s*(?:完整\s*)?(?:PRISMA|系统综述)|数字漏斗",
+    re.IGNORECASE,
+)
 
 # --- abbrev gloss check (CLAUDE.md Prose style 第 11 条 → lint 机械化) ---
 #
@@ -599,6 +725,194 @@ def _check_abbrev_gloss(
     ]
 
 
+_PAYWALL_DISCLOSURE_RE = re.compile(
+    r"全文|付费墙|无法获取|未能获取|未纳入量化|paywall|full[\-\s]?text", re.IGNORECASE
+)
+
+
+def _check_paywall_disclosure(
+    used_keys: list[str], by_key: dict[str, refs.Entry], review_text: str,
+    store: refs.Store | None = None,
+) -> list[str]:
+    """F14 / spec §0.6.j 付费墙披露: the disclosure obligation is about the DROPPED set
+    — verified entries on a declared gap whose fulltext could not be fetched (title-only)
+    and were therefore NOT cited ('N 条因无法获取全文未纳入量化结论'). M13: compute that
+    from the STORE, not only still-cited title-only entries (a compliantly-deleted entry
+    no longer appears in used_keys but still owes a disclosure). WARN, not FAIL."""
+    cited_title_only = {
+        key for key in set(used_keys)
+        if (entry := by_key.get(key)) is not None and refs.grounding(entry) == "title_only"
+    }
+    dropped = 0
+    if store is not None:
+        used = set(used_keys)
+        for entry in store.get("entries", {}).values():
+            if (entry.get("verification_status") == "verified"
+                    and not entry.get("excluded_reason")
+                    and isinstance(entry.get("gap"), str)
+                    and refs.grounding(entry) == "title_only"
+                    and entry.get("citation_key") not in used):
+                dropped += 1
+    total = len(cited_title_only) + dropped
+    if total and not _PAYWALL_DISCLOSURE_RE.search(review_text):
+        return [
+            f"[WARN] {total} 条 verified 文献仅 title-only（无可取全文；其中 {dropped} 条未被引用、"
+            "因无法获取全文而未纳入量化结论）但 §方法/§限定 未披露获取限制（F14/§0.6.j 付费墙披露）"
+        ]
+    return []
+
+
+_METADATA_NOTE_RE = re.compile(
+    r"预印本|preprint|关注声明|expression of concern|更正|勘误|erratum|corrigendum",
+    re.IGNORECASE,
+)
+
+
+def _check_metadata_annotation(
+    used_keys: list[str], by_key: dict[str, refs.Entry], review_text: str
+) -> list[str]:
+    """M3 (spec §0.6 元数据闸): a cited entry under an expression-of-concern, or a
+    preprint, must be flagged in prose. Retracted is already a hard FAIL upstream;
+    these are WARN (annotate, don't block)."""
+    warnings: list[str] = []
+    annotated = bool(_METADATA_NOTE_RE.search(review_text))
+    for key in sorted(set(used_keys)):
+        entry = by_key.get(key)
+        if entry is None:
+            continue
+        flags = refs.metadata_flags(entry)
+        if (flags["expression_of_concern"] or flags["erratum"] or flags["preprint"]) and not annotated:
+            label = (
+                "EoC（关注声明）" if flags["expression_of_concern"]
+                else "勘误/更正" if flags["erratum"]
+                else "预印本"
+            )
+            warnings.append(
+                f"[WARN] 被引 [@{key}] 是{label}但正文未标注（M3 元数据闸 / spec §0.6.k）"
+            )
+    return warnings
+
+
+# Clause boundary (spec §0.6.d 声明性子句): a sentence-ender / semicolon, OR a
+# Chinese comma followed by a coordinating conjunction (「X 降压，且老年安全」= two
+# clauses). A bare comma (e.g. "161 mg，85 mg" comparison) does NOT split — that
+# would over-segment one comparative claim.
+_CLAUSE_SPLIT_RE = re.compile(
+    r"(?<=[。！？!?；;])"
+    r"|(?<=，)(?=(?:且|并且|而且|同时|此外|另外|但|然而|不过|以及|或者?|并(?!不|未|没)))"
+)
+
+
+# A clause states a DATA VALUE (%, ‰, 倍/fold, a p-value, an inequality bound) — a checkable
+# empirical claim regardless of length. Deliberately NOT a bare decimal (so a section/figure ref
+# '§2.3' / '图 3.1' does not count as a claim).
+_DATA_VALUE_RE = re.compile(
+    r"\d\s*(?:%|‰|倍|fold)|[<>＜＞≤≥]\s*\d|\bp\s*[=<>]\s*0?\.\d", re.IGNORECASE
+)
+
+
+def _is_declarative(sentence: str) -> bool:
+    """A substantial declarative clause (spec §0.6.d 表层判据): enough content to be
+    a falsifiable statement — ≥8 CJK chars or ≥6 latin words (after stripping any
+    sidecar). Filters short transitions / fragments to bound false positives. Round-3
+    hardening: a clause that CITES a [@key] or states a DATA VALUE is a checkable claim
+    REGARDLESS of length — else a short cited clause (滴度 1024 [@k]) was counted
+    non-declarative and its sidecar 'covered' a longer orphan claim on the same line,
+    leaving the orphan's number un-mapped (the only non-faithfulness orphan path)."""
+    from lib import claimids
+
+    text = claimids.strip(sentence).strip()
+    # a CITED clause (with PROSE besides the marker — not a bare trailing ' [@k] ' fragment, which
+    # CITE_RE leaves as '[]') or a clause stating a DATA VALUE is a checkable claim regardless of
+    # length. NB CITE_RE matches '@key' not the brackets, so test for real residual content.
+    has_prose = bool(re.search(r"[一-鿿]|[A-Za-z]{2,}", CITE_RE.sub("", text)))
+    if (CITE_RE.search(text) and has_prose) or _DATA_VALUE_RE.search(text):
+        return True
+    cjk = len(re.findall(r"[一-鿿]", text))
+    latin = len(re.findall(r"[A-Za-z]{2,}", text))
+    return cjk >= 8 or latin >= 6
+
+
+def _check_claim_id_coverage(review_text: str) -> list[str]:
+    """F3 (spec §0.6.a/d): once the writer emits ``<!-- claim:CID -->`` sidecars,
+    **every declarative clause** in the body must carry one — factual (grounded) or
+    ``type:inference`` (裁决/综合/过渡, grounding-exempt). The deterministic surface
+    check (spec §0.6.d): for each prose line, #declarative-sentences ≤ #claim_ids
+    (catches '句内从句漏拆'). Skips headings / tables / lists / §方法 / References /
+    code. OPT-IN: no sidecars at all → skip (write_gate enforces 'must have sidecars'
+    for non-legacy; this enforces full coverage once the writer is using F1)."""
+    from lib import claimids
+
+    if not claimids.has(review_text):
+        return []
+    errors: list[str] = []
+    in_code = False
+    in_prisma = False  # auto-generated PRISMA-flow funnel — render_refs owns it
+    tail = False  # References onward — structural, skipped
+    for line in review_text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("```"):
+            in_code = not in_code
+            continue
+        if in_code:
+            continue
+        # the PRISMA flow funnel (render_refs output between markers) is machine-
+        # generated structural text, not authored claims — skip the whole region.
+        if "prisma-flow:start" in stripped:
+            in_prisma = True
+            continue
+        if "prisma-flow:end" in stripped:
+            in_prisma = False
+            continue
+        if in_prisma:
+            continue
+        # §方法 prose facts ARE mapped (spec §0.6.a: 检索 PubMed / 纳入 23 篇 →
+        # key_type=research_log); only References is structural-tail.
+        if stripped.startswith("#") and any(
+            k in stripped for k in ("References", "参考文献")
+        ):
+            tail = True
+        if tail or not stripped:
+            continue
+        if stripped.startswith(("#", ">", "<!--")):
+            continue
+        # [5] (spec §0.6.a): a list bullet / table cell isn't run through full clause
+        # splitting (imperative 实操 bullets aren't claims), but a CITED fact inside one
+        # (实操建议表 cell with [@key]) still needs a sidecar — require ≥1 claim_id per
+        # [@key] on the line.
+        is_bullet = bool(re.match(r"^[-*+]\s|^\d+[.)]\s", stripped))
+        if stripped.startswith("|") or is_bullet:
+            n_keys = len(CITE_RE.findall(line))
+            n_ids = len(claimids.CLAIM_ID_RE.findall(line))
+            if n_keys > n_ids:
+                errors.append(
+                    "[FAIL] 列表/表格内 %d 个被引事实仅 %d 个 claim_id（spec §0.6.a/d）: %s"
+                    % (n_keys, n_ids, stripped[:50])
+                )
+            continue
+        # Strip the sidecars BEFORE splitting so a `<!-- claim:… -->` literal's '!'
+        # can't phantom-split into an extra clause; count the claim_ids from the
+        # ORIGINAL line.
+        n_claims = len(claimids.CLAIM_ID_RE.findall(line))
+        prose = claimids.strip(stripped)
+        clauses = [c for c in _CLAUSE_SPLIT_RE.split(prose) if _is_declarative(c)]
+        if len(clauses) > n_claims:
+            errors.append(
+                "[FAIL] %d 个声明性子句仅 %d 个 claim_id（F1/F3 全覆盖，spec §0.6.d）: %s"
+                % (len(clauses), n_claims, stripped[:50])
+            )
+    # claim_id must be UNIQUE — a reused id makes the assertion map ambiguous
+    # (two distinct clauses → one map row, faithfulness can't tell which it judged).
+    all_ids = claimids.ids_in(review_text)
+    dupes = sorted({cid for cid in all_ids if all_ids.count(cid) > 1})
+    if dupes:
+        errors.append(
+            "[FAIL] claim_id 必须唯一，以下重复（spec §0.6.a 断言级一一映射）: %s"
+            % ", ".join(dupes[:8])
+        )
+    return errors
+
+
 def _check_review_structure(review_text: str) -> list[str]:
     """Warn if review.md is missing the structural sections required by the
     project review template: 限定与争议 + 方法 (PRISMA-flow + 检索表 lives
@@ -607,15 +921,36 @@ def _check_review_structure(review_text: str) -> list[str]:
     These are WARN (not FAIL) so legacy reviews don't break the lint pipeline,
     but new reviews should add them — playbook §7."""
     warnings: list[str] = []
-    if not _LIMIT_SECTION_RE.search(review_text):
+    has_limit = bool(_LIMIT_SECTION_RE.search(review_text))
+    has_method = bool(_METHOD_SECTION_RE.search(review_text))
+    if not has_limit:
         warnings.append(
             "[WARN] review.md missing §限定与争议 / 局限 section — playbook §7 要求"
         )
-    if not _METHOD_SECTION_RE.search(review_text):
+    if not has_method:
         warnings.append(
             "[WARN] review.md missing §方法 section (PRISMA-flow + 检索表; "
             "should be at end before References) — playbook §7 要求"
         )
+    # W1 (plan v3.1 / spec §目标边界): §限定 must surface the declared
+    # compromises (非「零」/非「全面」/非系统综述). WARN if the section exists but
+    # carries none of the disclosure language.
+    if has_limit and not _COMPROMISE_RE.search(review_text):
+        warnings.append(
+            "[WARN] §限定与争议 未声明 §目标边界 妥协（非「零」幻觉 / 非「全面」/ "
+            "非系统综述 / 低且有界）— W1 / spec §目标边界"
+        )
+    # W2 (spec N7 §方法): the methods section must record 检索日期 + 纳排标准 and
+    # disclaim the PRISMA funnel as NOT a full systematic review.
+    if has_method:
+        if not _SEARCH_DATE_RE.search(review_text):
+            warnings.append("[WARN] §方法 缺检索日期 / 语言年份限制 — W2 / spec N7")
+        if not _INCL_EXCL_RE.search(review_text):
+            warnings.append("[WARN] §方法 缺纳入/排除标准 — W2 / spec N7")
+        if not _PRISMA_DISCLAIMER_RE.search(review_text):
+            warnings.append(
+                "[WARN] §方法 PRISMA 漏斗未声明「非完整 PRISMA-S 系统综述」— W2 / spec N7"
+            )
     return warnings
 
 
@@ -943,6 +1278,8 @@ def main() -> None:
         )
         if not args.skip_prose_metadata:
             errors.extend(_check_prose_metadata(review_text, occurrences, by_key))
+        # F3 claim_id coverage — opt-in (silent unless the writer emits sidecars).
+        errors.extend(_check_claim_id_coverage(review_text))
 
         # gap classification (gap_type + required sub-fields + dep / subgap
         # phantom refs). Classification problems are mostly WARN for now —
@@ -963,6 +1300,21 @@ def main() -> None:
             warnings.extend(_check_gap_count_and_breadth(store))
             warnings.extend(_check_protocol_filled(topic_dir))
             warnings.extend(_check_review_structure(review_text))
+            warnings.extend(
+                _check_gap_in_proposition_section(occurrences, store, review_text)
+            )
+            # G4 (workflow_spec §4): title-only anchoring a quantitative claim is
+            # a grounding/fact-risk → FAIL (exit 1), not WARN. Legacy stores skip
+            # the whole non-legacy branch, so they keep grandfathered.
+            errors.extend(
+                _check_title_only_quantitative(occurrences, by_key, review_text)
+            )
+            warnings.extend(
+                _check_paywall_disclosure(used_keys, by_key, review_text, store)
+            )
+            warnings.extend(
+                _check_metadata_annotation(used_keys, by_key, review_text)
+            )
         warnings.extend(_check_broad_gaps(used_keys, store))
         # Abbreviation gloss WARN (Prose style 第 11 条). On by default; the
         # .lint_legacy marker silences it like the other structure warnings,

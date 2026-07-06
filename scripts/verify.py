@@ -12,7 +12,7 @@ from typing import Literal, cast
 sys.path.insert(0, str(pathlib.Path(__file__).parent))
 
 import fetch
-from lib import apis, config, project, testflight
+from lib import apis, cli_runtime, config, project, testflight
 from lib.crossref_parse import (
     CONCERN_TYPES,
     PUBTYPE_KEYWORDS,
@@ -439,6 +439,10 @@ def apply_verify_result(entry: refs.Entry, result: VerifyResult) -> refs.Entry:
     entry["verification"] = result.verification
     entry["retracted"] = result.retracted
     entry["retraction_notes"] = result.retraction_notes
+    # M1 (spec §2 verify --add OUT): persist the normalized publication-integrity
+    # STATUS FIELDS — not just derive booleans at read time. journal + verification
+    # + retracted are all set above, so metadata_flags is now accurate.
+    entry["metadata_status"] = refs.metadata_status_fields(entry)
     if result.blocklist_reason:
         refs.add_to_blocklist(
             result.doi,
@@ -1189,10 +1193,94 @@ def _handle_add(
     return _add_exit_code(outcome, False, retracted_new, False)
 
 
+def _handle_add_batch(
+    topic_dir: pathlib.Path,
+    batch_path: pathlib.Path,
+    *,
+    default_gap: str | None,
+    source: str,
+    round_number: int,
+    cross_check_rw: bool,
+    force_mismatch: set[str] | None = None,
+    force_mismatch_reason: str | None = None,
+    study_type_override: str | None = None,
+    readd: bool = False,
+    readd_reason: str | None = None,
+) -> int:
+    """Add many entries from a TSV (DOI<TAB>TITLE<TAB>YEAR<TAB>AUTHORS[<TAB>GAP])
+    in one process, reusing _handle_add per row — so blocklist / sticky-exclusion
+    / force-mismatch / study_type / title_mismatch handling are byte-identical to
+    a single --add, just without the per-row interpreter cold-start. Blank and
+    '#'-prefixed lines are skipped; a malformed or failing row is reported and
+    skipped (the batch never aborts). Per-row GAP overrides --gap (empty GAP →
+    falls back to --gap). Returns the worst per-row exit code
+    (2 verify-error > 1 config-error > 0 ok/warn)."""
+    try:
+        text = batch_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        print(
+            f"[ERROR] cannot read --add-batch file {batch_path}: {exc}",
+            file=sys.stderr,
+        )
+        return 1
+    worst = 0
+    processed = non_ok = 0
+    for lineno, raw in enumerate(text.splitlines(), start=1):
+        if not raw.strip() or raw.lstrip().startswith("#"):
+            continue
+        parts = raw.split("\t")
+        if len(parts) < 4:
+            print(
+                f"[ERROR] line {lineno}: expected "
+                "DOI<TAB>TITLE<TAB>YEAR<TAB>AUTHORS[<TAB>GAP], got "
+                f"{len(parts)} field(s) — skipped",
+                file=sys.stderr,
+            )
+            non_ok += 1
+            worst = max(worst, 2)
+            continue
+        doi, title, year_text, authors_text = (p.strip() for p in parts[:4])
+        row_gap = (
+            parts[4].strip()
+            if len(parts) >= 5 and parts[4].strip()
+            else default_gap
+        )
+        processed += 1
+        print(f"--- line {lineno}: {doi} ---")
+        rc = _handle_add(
+            topic_dir,
+            add_args=(doi, title, year_text, authors_text),
+            gap_id=row_gap,
+            source=source,
+            round_number=round_number,
+            cross_check_rw=cross_check_rw,
+            force_mismatch=force_mismatch,
+            force_mismatch_reason=force_mismatch_reason,
+            study_type_override=study_type_override,
+            readd=readd,
+            readd_reason=readd_reason,
+        )
+        if rc != 0:
+            non_ok += 1
+        worst = max(worst, rc)
+    print(f"=== add-batch: {processed} row(s) processed, {non_ok} non-OK ===")
+    return worst
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("topic_dir", help="Path to a topic directory under reviews/")
     parser.add_argument("--add", nargs=4, metavar=("DOI", "TITLE", "YEAR", "AUTHORS"))
+    parser.add_argument(
+        "--add-batch",
+        metavar="FILE",
+        help="Batch-add entries from a TSV (DOI<TAB>TITLE<TAB>YEAR<TAB>AUTHORS"
+        "[<TAB>GAP]) in ONE process — no per-row interpreter cold-start. Blank "
+        "and '#'-prefixed lines are skipped; a malformed or failing row is "
+        "reported and skipped (batch never aborts). Per-row GAP overrides "
+        "--gap. Pairs with `search.py --emit-batch`. Mutually exclusive with "
+        "--add.",
+    )
     parser.add_argument(
         "--gap",
         metavar="GAP_ID",
@@ -1247,6 +1335,15 @@ def main() -> None:
         "--secondary-type",
         choices=_GAP_TYPE_CHOICES,
         help="Optional secondary type for cross-class gaps (e.g. decision+mechanism).",
+    )
+    parser.add_argument(
+        "--query",
+        help="(--declare-gap) spec-N2 per-gap search query — English/optimized terms used by the "
+             "round instead of the CJK description (which returns wrong-language noise). Persisted.",
+    )
+    parser.add_argument(
+        "--relevance-terms",
+        help="(--declare-gap) spec-N2 per-gap relevance terms for the C2 gate / genealogy. Persisted.",
     )
     parser.add_argument(
         "--depends-on",
@@ -1435,7 +1532,13 @@ def main() -> None:
 
     try:
         topic_dir = pathlib.Path(args.topic_dir)
-        op = "add" if args.add else "bulk"
+        if args.add and args.add_batch:
+            print(
+                "[ERROR] --add and --add-batch are mutually exclusive.",
+                file=sys.stderr,
+            )
+            raise SystemExit(1)
+        op = "add" if args.add else ("add_batch" if args.add_batch else "bulk")
         with testflight.timer(
             "verify",
             op,
@@ -1491,6 +1594,8 @@ def main() -> None:
                         fields=fields,
                         depends_on=args.depends_on or None,
                         subgap_of=args.subgap_of,
+                        query=args.query,
+                        relevance_terms=args.relevance_terms,
                         addendum=args.addendum,
                     )
 
@@ -1514,6 +1619,7 @@ def main() -> None:
                 # register a gap label.
                 bulk_verify_requested = (
                     bool(args.add)
+                    or bool(args.add_batch)
                     or args.doi is not None
                     or args.recheck
                     or args.limit
@@ -1528,6 +1634,23 @@ def main() -> None:
                         topic_dir,
                         add_args=cast(tuple[str, str, str, str], tuple(args.add)),
                         gap_id=args.gap,
+                        source=args.source,
+                        round_number=args.round_number,
+                        cross_check_rw=args.cross_check_rw,
+                        force_mismatch=force_mismatch,
+                        force_mismatch_reason=args.force_mismatch_reason,
+                        study_type_override=args.study_type,
+                        readd=args.readd,
+                        readd_reason=args.readd_reason,
+                    )
+                )
+
+            if args.add_batch:
+                raise SystemExit(
+                    _handle_add_batch(
+                        topic_dir,
+                        pathlib.Path(args.add_batch),
+                        default_gap=args.gap,
                         source=args.source,
                         round_number=args.round_number,
                         cross_check_rw=args.cross_check_rw,
@@ -1599,5 +1722,13 @@ def main() -> None:
         raise SystemExit(2)
 
 
+def run(argv: list[str], cwd: str | None = None, env: dict[str, str] | None = None) -> int:
+    """In-process entry for the daemon (E3) / tests; wraps main() via
+    cli_runtime so the exit-code contract matches the standalone CLI."""
+    return cli_runtime.invoke(main, argv, prog="verify.py", cwd=cwd, env=env)
+
+
 if __name__ == "__main__":
-    main()
+    from lib import daemon
+
+    raise SystemExit(daemon.cli_entry("verify", main))

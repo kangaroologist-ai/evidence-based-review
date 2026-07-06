@@ -16,6 +16,10 @@ Schema:
       require_rct_or_meta: false
       require_primary_evidence_per_gap: 1
     default_search_sources: [crossref, semantic_scholar]
+    protocol_defaults:
+      inclusion: "..."
+      exclusion: "..."
+      outcomes: "..."
     ---
 
 The `health` domain has patches/health.md whose frontmatter mirrors
@@ -42,6 +46,10 @@ KNOWN_DOMAINS entry that has no patch file yet.
 - ``default_search_sources`` — **ADVISORY**. search.py currently defaults
   to ``--source both`` (CrossRef + Semantic Scholar) regardless of patch.
   Future work could add EuPMC for health domain etc.
+- ``protocol_defaults`` — wired into bootstrap_topic.py: inclusion / exclusion
+  / outcomes prose rendered into research_log.md's protocol section (the user
+  then specialises per topic). A missing key falls back to the ``_user 填_``
+  placeholder.
 - ``gap_types_dominant`` — informational; not used by any tool.
 """
 from __future__ import annotations
@@ -63,12 +71,21 @@ class TermCheckOverrides(TypedDict, total=False):
     require_primary_evidence_per_gap: int
 
 
+class ProtocolDefaults(TypedDict, total=False):
+    # Domain-stable protocol prose rendered into research_log.md's protocol
+    # section by bootstrap_topic.py (the user then specialises per topic).
+    inclusion: str
+    exclusion: str
+    outcomes: str
+
+
 class PatchConfig(TypedDict, total=False):
     domain: str
     gap_types_dominant: list[str]
     evidence_base: EvidenceBase
     term_check_overrides: TermCheckOverrides
     default_search_sources: list[str]
+    protocol_defaults: ProtocolDefaults
 
 
 # Merge base for every patch + fallback for a KNOWN_DOMAINS entry with
@@ -88,6 +105,19 @@ DEFAULT_PATCH: PatchConfig = {
         "require_primary_evidence_per_gap": 1,
     },
     "default_search_sources": ["crossref", "semantic_scholar"],
+    "protocol_defaults": {
+        "inclusion": (
+            "人体研究：系统综述/meta、RCT、大型前瞻队列、临床指南与共识；"
+            "英文为主；近 10–15 年优先，奠基性研究不限年代"
+        ),
+        "exclusion": (
+            "纯动物/体外机制研究（仅在缺人体证据时作机制支撑）、无对照个案、"
+            "未标注的预印本"
+        ),
+        "outcomes": (
+            "以临床/功能结局为准（疗效、风险、剂量反应；硬终点优先于替代指标）"
+        ),
+    },
 }
 
 # Domains the workflow knows about. New patches must be added here so

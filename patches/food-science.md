@@ -9,6 +9,10 @@ term_check_overrides:
   require_rct_or_meta: false
   require_primary_evidence_per_gap: 1
 default_search_sources: [crossref, semantic_scholar]
+protocol_defaults:
+  inclusion: "食品化学/微生物/工程/感官/安全法规的同行评议研究 + 权威标准（Codex/EFSA/FDA/AOAC/GB）；英文为主"
+  exclusion: "人体营养摄入推荐（走 health 域）、宠物食品配方（走 animals 域）、无方法的产品宣传"
+  outcomes: "以食品理化/微生物/感官/安全指标为准；本域不产生 RCT/meta（term_check 已豁免该闸）"
 ---
 
 # 主题补丁 — 食品科学

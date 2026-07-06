@@ -374,6 +374,10 @@ def main() -> None:
     if not src.is_file():
         sys.exit(f"not a file: {src}")
     text = src.read_text(encoding="utf-8")
+    # Strip claim_id sidecars so the delivered HTML never carries the
+    # internal IDs (they are invisible comments anyway, but this is explicit).
+    from lib import claimids
+    text = claimids.strip(text)
 
     title = args.title
     if not title:

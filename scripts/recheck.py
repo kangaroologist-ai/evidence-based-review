@@ -6,8 +6,8 @@ process isolation and verify.py's complete CLI (rather than entangling an
 all-topics loop into verify.py's single-topic main). Use it to sweep the whole
 ``reviews/`` tree for newly-retracted / newly-failed DOIs every so often:
 
-    python scripts/recheck.py reviews/<topic>      # one topic
-    python scripts/recheck.py --all-topics         # every topic with a store
+    python tools/recheck.py reviews/<topic>      # one topic
+    python tools/recheck.py --all-topics         # every topic with a store
 
 Single-topic mode is equivalent to running ``verify.py <topic> --recheck``
 directly; the only thing this tool adds is the ``--all-topics`` sweep + a

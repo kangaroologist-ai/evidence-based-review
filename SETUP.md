@@ -151,6 +151,13 @@ exponential backoff + retry, so throttling slows a run down — it never breaks 
 
 Add keys later if and when the wait bothers you. Nothing else changes.
 
+**Optional: OCR for scanned PDFs.** `fetch.py` falls back to OCR only when a PDF's
+born-digital text extraction comes back empty (old, scanned-only papers). This needs
+a [MinerU](https://github.com/opendatalab/MinerU)-class CLI on PATH (`mineru` /
+`magic-pdf`, or point `HEALTH_REVIEW_OCR_CMD` at one) — entirely optional, every
+failure mode (binary missing, nonzero exit, timeout) degrades silently to
+`title_only` grounding rather than erroring.
+
 ---
 
 ## 5. Quick start

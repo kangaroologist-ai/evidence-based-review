@@ -6,8 +6,8 @@ duplicate after dedupe, etc.). Refuses to delete entries that have already
 been cited in `review.md` so accidental deletions don't break lint.
 
 Usage:
-    python scripts/delete.py reviews/<topic> DOI
-    python scripts/delete.py reviews/<topic> DOI --force   # bypass cited check
+    python tools/delete.py reviews/<topic> DOI
+    python tools/delete.py reviews/<topic> DOI --force   # bypass cited check
 """
 from __future__ import annotations
 

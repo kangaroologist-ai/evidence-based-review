@@ -9,6 +9,10 @@ term_check_overrides:
   require_rct_or_meta: false
   require_primary_evidence_per_gap: 1
 default_search_sources: [semantic_scholar, crossref]
+protocol_defaults:
+  inclusion: "实验测量/数值模拟/解析推导的同行评议研究 + 权威综述与教材（RPP/CODATA）；不限年代（奠基论文常很老）"
+  exclusion: "无方法细节的科普、未经同行评议的 arXiv 预印本（除非关键且标注）"
+  outcomes: "以物理量/守恒律/标度律/不确定度为准；本域不产生 RCT/meta（term_check 已豁免该闸）"
 ---
 
 # 主题补丁 — 物理学

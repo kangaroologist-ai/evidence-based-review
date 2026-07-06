@@ -9,6 +9,10 @@ term_check_overrides:
   require_rct_or_meta: false
   require_primary_evidence_per_gap: 1
 default_search_sources: [crossref, semantic_scholar]
+protocol_defaults:
+  inclusion: "家养/同伴动物（猫/犬/兔等）同行评议研究 + 主要学会指南（NRC/AAFCO/FEDIAF/WSAVA/AAHA/AVDC）；英文为主；物种相对'大队列'阈值（猫犬 n=80–500 即大样本）"
+  exclusion: "纯生产/实验诱导模型且无临床外推、其它物种专属且无目标物种数据、无 DOI 厂商白皮书（除非用户手供）"
+  outcomes: "以临床/营养结局为准（疾病分级、患病率、能量/营养需求、围术期并发症）；study_type=other ≠ 弱证据，按 abstract 手判设计"
 ---
 
 # 主题补丁 — 伴侣动物 / 小动物兽医营养

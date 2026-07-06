@@ -1,17 +1,20 @@
 from __future__ import annotations
 
 import argparse
+import collections
+import functools
 import json
 import pathlib
 import re
 import sys
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Literal, cast
 
 sys.path.insert(0, str(pathlib.Path(__file__).parent))
 
-from lib import apis, project, testflight
+from lib import apis, cli_runtime, project, testflight
 import refs
 
 FetchStatus = Literal["pending", "succeeded", "failed", "skipped"]
@@ -30,6 +33,8 @@ STATE_KEY_MAP = {"fulltext": "fulltext_xml"}
 # apply_fetch_result, never via these helpers.
 _FETCH_STATE_KEYS = frozenset({"abstract", "fulltext_xml", "figures", "tables", "pdf"})
 SECTION_RE = re.compile(r"<sec\b[^>]*>\s*<title>([^<]+)</title>(.*?)</sec>", re.I | re.S)
+# JATS abstract element (skip trans-abstract translations — abstract-type="..." is fine).
+ABSTRACT_RE = re.compile(r"<abstract\b[^>]*>(.*?)</abstract>", re.I | re.S)
 TAG_RE = re.compile(r"<[^>]+>")
 SPACE_RE = re.compile(r"\s+")
 
@@ -98,6 +103,58 @@ def resolve_text_status(text: str) -> FetchStatus:
     return "failed"
 
 
+def _positive_lru(maxsize: int):
+    """F6 (plan §8.2): a thread-safe LRU that memoizes ONLY truthy results.
+
+    Process-level memoization of the per-DOI metadata fetchers (mirrors
+    genealogy.py's work_by_doi lru_cache): apis.* already disk-caches, but the
+    same DOI gets re-fetched across gaps / retries within one process, so the
+    in-memory cache saves the repeat disk read + JSON parse.
+
+    Why NOT plain @functools.lru_cache: apis.* deliberately does NOT disk-cache a
+    *transient* failure (429 / timeout surfaces as None / "" so the next call
+    retries). A plain lru_cache would memoize that transient None / "" for the
+    whole process — and the daemon reuses ONE process across all requests/topics
+    with no per-request cache_clear, so a single transient failure would stick a
+    DOI as "missing" until daemon restart: a silent recall leak. Caching only
+    truthy results keeps repeat positive lookups fast (F6's goal) while leaving
+    failures retryable. Definitive 404s stay cheap regardless — apis disk-caches
+    those, so a re-fetch hits the disk negative-cache, not the network.
+
+    Concurrency: callers (fetch --parallel) may hit these concurrently. The lock
+    guards the OrderedDict ops; the underlying fn() runs OUTSIDE the lock, so two
+    concurrent misses may double-compute the same idempotent value (same as
+    lru_cache) without corrupting the cache. Returns are READ-ONLY by contract —
+    a cached dict must not be mutated in place (verified: all four consumers in
+    fetch_compute only .get()/read).
+    """
+
+    def decorator(fn):
+        data: collections.OrderedDict = collections.OrderedDict()
+        lock = threading.Lock()
+
+        @functools.wraps(fn)
+        def wrapper(key: str):
+            with lock:
+                if key in data:
+                    data.move_to_end(key)
+                    return data[key]
+            result = fn(key)
+            if result:  # only memoize positives — failures stay retryable
+                with lock:
+                    data[key] = result
+                    data.move_to_end(key)
+                    while len(data) > maxsize:
+                        data.popitem(last=False)
+            return result
+
+        wrapper.cache_clear = data.clear  # type: ignore[attr-defined]
+        return wrapper
+
+    return decorator
+
+
+@_positive_lru(maxsize=4096)
 def eupmc_search(doi: str) -> dict[str, object] | None:
     payload = apis.get_json(
         f"{EUPMC_BASE}/search",
@@ -113,14 +170,17 @@ def eupmc_search(doi: str) -> dict[str, object] | None:
     return first if isinstance(first, dict) else None
 
 
+@_positive_lru(maxsize=4096)
 def unpaywall(doi: str) -> dict[str, object] | None:
     return apis.get_json(f"{UNPAYWALL_BASE}/{doi}", params={"email": apis.EMAIL})
 
 
+@_positive_lru(maxsize=256)  # full-text XML can be large → smaller bound
 def eupmc_xml(pmcid: str) -> str:
     return apis.get_text(f"{EUPMC_BASE}/{pmcid}/fullTextXML") or ""
 
 
+@_positive_lru(maxsize=4096)
 def crossref_abstract(doi: str) -> str:
     """Return CrossRef's stored abstract (JATS markup stripped) or empty."""
     payload = apis.get_json(
@@ -140,6 +200,17 @@ def section(xml_text: str, names: tuple[str, ...]) -> str:
         if any(name in normalized_title for name in names):
             return _clean_text(body)[:6000]
     return ""
+
+
+def xml_abstract(xml_text: str) -> str:
+    """The abstract embedded in the full-text JATS XML (first <abstract> element).
+
+    EuPMC's abstractText metadata field and CrossRef's abstract are routinely empty
+    for BMJ articles and brief reports even when the OA full-text XML carries a real
+    abstract. Pulling it from the XML is the difference between a grounded card and a
+    silently-dropped fulltext (has_fulltext_xml=True with no readable path)."""
+    match = ABSTRACT_RE.search(xml_text)
+    return _clean_text(match.group(1))[:6000] if match else ""
 
 
 def _suffix_from_href(href: str) -> str:
@@ -387,10 +458,18 @@ def fetch_compute(
             cr_abstract = crossref_abstract(doi)
             if len(cr_abstract) > len(abstract_text):
                 abstract_text = cr_abstract
-        if hit is None and not abstract_text:
-            result.paths_updates["abstract"] = None
-            result.fetch_state_updates["abstract"] = "skipped"
-        elif abstract_text:
+        # Fall back to the abstract embedded in the full-text XML when the metadata
+        # APIs return none. Without this, an OA article whose EuPMC abstractText and
+        # CrossRef abstract are both empty (BMJ, brief reports) had its retrievable XML
+        # content silently dropped — write_card was skipped, no path persisted, yet
+        # has_fulltext_xml stayed True → grounding() advertised "fulltext" with nothing
+        # to read (every citing claim → `insufficient`, a hard write_gate FAIL).
+        if not abstract_text and xml_text:
+            abstract_text = xml_abstract(xml_text)
+        # Write the card whenever ANY readable content was recovered (abstract proper,
+        # or intro/conclusion lifted from the XML). The card IS the persisted readable
+        # artifact behind grounding="fulltext"/"abstract"; only its absence is title_only.
+        if abstract_text or introduction or conclusion:
             card_path = write_card(
                 snapshot,
                 abstract_text,
@@ -399,7 +478,12 @@ def fetch_compute(
                 abstracts_dir,
             )
             result.paths_updates["abstract"] = project.to_rel(card_path)
-            result.fetch_state_updates["abstract"] = resolve_text_status(abstract_text)
+            result.fetch_state_updates["abstract"] = resolve_text_status(
+                abstract_text or introduction or conclusion
+            )
+        elif hit is None:
+            result.paths_updates["abstract"] = None
+            result.fetch_state_updates["abstract"] = "skipped"
         else:
             result.paths_updates["abstract"] = None
             result.fetch_state_updates["abstract"] = "failed"
@@ -694,5 +778,13 @@ def main() -> None:
     print(f"fetched {processed} entries")
 
 
+def run(argv: list[str], cwd: str | None = None, env: dict[str, str] | None = None) -> int:
+    """In-process entry for the daemon (E3) / tests; wraps main() via
+    cli_runtime so the exit-code contract matches the standalone CLI."""
+    return cli_runtime.invoke(main, argv, prog="fetch.py", cwd=cwd, env=env)
+
+
 if __name__ == "__main__":
-    main()
+    from lib import daemon
+
+    raise SystemExit(daemon.cli_entry("fetch", main))

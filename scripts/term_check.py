@@ -156,6 +156,18 @@ def evaluate_store(store: refs.Store) -> TermCheckResult:
             "或在 §限定与争议 写明该证据不足。"
         )
 
+    # plan v3 §3.4 C18: grounding coverage. Only meaningful once fetch has run
+    # (some entry is grounded); on a fresh/pre-fetch store every entry is
+    # title-only and the round-loop W12 sweep handles grounding, so we stay
+    # silent there to avoid noise. When grounding IS tracked, warn for any gap
+    # whose floor rests on fewer than the minimum GROUNDED supports — i.e. it is
+    # "saturating" largely on papers whose content was never read.
+    store_has_grounding = any(
+        refs.is_grounded(entry)
+        for entry in store["entries"].values()
+        if _is_eligible(entry)
+    )
+
     for gap_id in sorted(store.get("gaps", {})):
         entries = _gap_evidence_pool(store, gap_id)
         if len(entries) < config.TERM_MIN_VERIFIED_PER_GAP:
@@ -163,6 +175,15 @@ def evaluate_store(store: refs.Store) -> TermCheckResult:
                 f"[FAIL] {gap_id} verified={len(entries)} "
                 f"< min={config.TERM_MIN_VERIFIED_PER_GAP}"
             )
+        if store_has_grounding:
+            grounded = [e for e in entries if refs.is_grounded(e)]
+            if len(grounded) < config.TERM_MIN_VERIFIED_PER_GAP:
+                advisory.append(
+                    f"[WARN] {gap_id} grounded={len(grounded)} "
+                    f"< min={config.TERM_MIN_VERIFIED_PER_GAP} —— 该 gap 主要靠 "
+                    "title-only 条目支撑（没人读过正文）；notes 前跑 "
+                    "`fetch --retry-failed` / 升级抓全文 (C15/C17/C19) 再信其结论 (C18)"
+                )
         # The RCT/meta floor only fits gaps that ask "does X work / which is
         # better" — decision & comparison. diagnostic / safety / mechanism /
         # descriptive / methodology legitimately rest on cohort, case-series,
@@ -184,17 +205,53 @@ def evaluate_store(store: refs.Store) -> TermCheckResult:
     eligible_entries = [entry for entry in store["entries"].values() if _is_eligible(entry)]
     if not eligible_entries:
         blocking.append("[FAIL] no verified non-excluded entries")
-    else:
-        latest_entries = [
-            entry
-            for entry in eligible_entries
-            if entry.get("added_round") == current_round
-        ]
-        ratio = len(latest_entries) / len(eligible_entries)
-        if ratio > config.TERM_SATURATION_RATIO and not latest_is_addendum:
+    elif not latest_is_addendum:
+        # plan v3 §3.3 C3: saturation requires TERM_SATURATION_CONSECUTIVE
+        # consecutive non-addendum rounds (ending at current_round) to each add
+        # ≤ TERM_SATURATION_RATIO of the pool eligible up to that round. A single
+        # low-growth round can be a cap artifact; K consecutive low rounds is the
+        # real loop-until-dry signal. (Probe-veto — re-search before declaring
+        # dry — lives in the round-loop workflow, not this pure store check.)
+        need = max(1, config.TERM_SATURATION_CONSECUTIVE)
+        confirmed = 0
+        offending: tuple[int, int, int, float] | None = None
+        cap_throttled: tuple[int, int] | None = None  # (round, effective_max_add) — F6
+        round_meta = store.get("round_meta", {}) or {}
+        r = current_round
+        while confirmed < need and r >= 1:
+            if r in addendum_rounds:
+                r -= 1
+                continue
+            in_round = sum(1 for e in eligible_entries if e.get("added_round") == r)
+            upto = sum(1 for e in eligible_entries if (e.get("added_round") or 0) <= r)
+            rr = (in_round / upto) if upto else 0.0
+            if rr > config.TERM_SATURATION_RATIO:
+                offending = (r, in_round, upto, rr)
+                break
+            # F6 (testflight #2): a round whose genealogy stopped at the per-gap
+            # cap (candidates remained) was THROTTLED, not exhausted — its low
+            # growth is a cap artifact and cannot confirm saturation. This closes
+            # the "tight --max-add fakes saturated" hole that operator discipline
+            # alone (CLAUDE.md prose) did not enforce.
+            rmeta = round_meta.get(str(r)) or {}
+            if rmeta.get("genealogy_cap_hit"):
+                cap_throttled = (r, int(rmeta.get("effective_max_add") or 0))
+                break
+            confirmed += 1
+            r -= 1
+        if cap_throttled is not None:
+            cr, ccap = cap_throttled
             waivable.append(
-                f"[FAIL] latest round added {len(latest_entries)}/{len(eligible_entries)} "
-                f"verified entries ({ratio:.1%}) > saturation={config.TERM_SATURATION_RATIO:.0%}"
+                f"[FAIL] saturation 不成立：round {cr} 命中 genealogy cap "
+                f"(--max-add={ccap}, 候选未取尽) — 低增长是 cap 节流假象、非枯竭。"
+                f"用更大 --max-add (或 --cap-auto) 重跑该轮 + analyst, 按有效新增% 重判 (F6)。"
+            )
+        elif offending is not None:
+            orr, oin, oupto, oratio = offending
+            waivable.append(
+                f"[FAIL] saturation needs {need} consecutive rounds adding "
+                f"≤{config.TERM_SATURATION_RATIO:.0%}; round {orr} added {oin}/{oupto} "
+                f"({oratio:.1%})"
             )
 
     effective_fails = blocking if is_hard_stop else blocking + waivable

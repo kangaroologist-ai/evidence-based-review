@@ -15,19 +15,44 @@ from lib.pdfx import extract_sections
 import refs
 
 
+def _sections_empty(sections: dict[str, object]) -> bool:
+    """True when born-digital extraction yielded no usable text in any section
+    (a scanned / image-only PDF) — the trigger for the OCR rung."""
+    return not any(
+        isinstance(sections.get(k), str) and sections[k].strip()  # type: ignore[union-attr]
+        for k in ("abstract", "introduction", "conclusion")
+    )
+
+
 def _extract_one(pdf_path_str: str) -> dict[str, object]:
     """Worker function — runs in a child process (pymupdf is CPU-bound and
     holds the GIL during parsing, so threads do not help; processes do)."""
     try:
-        return dict(extract_sections(pdf_path_str))
+        sections = dict(extract_sections(pdf_path_str))
     except Exception as exc:  # pragma: no cover — child-side guard
-        return {
+        sections = {
             "abstract": "",
             "introduction": "",
             "conclusion": "",
             "extraction_status": "failed",
             "error": str(exc),
         }
+    # plan v3 §3.4 C19: born-digital extraction empty (scanned PDF) → OCR rung.
+    # MinerU runs as a subprocess and returns None when unavailable, so this is
+    # a no-op (stays title_only) on hosts without MinerU.
+    if _sections_empty(sections):
+        try:
+            from lib import ocr
+
+            text = ocr.ocr_pdf(pdf_path_str)
+        except Exception:  # pragma: no cover — defensive; ocr_pdf already guards
+            text = None
+        if text and text.strip():
+            sections["ocr_text"] = text.strip()
+            sections["introduction"] = text.strip()
+            sections["ocr_used"] = True
+            sections["extraction_status"] = "succeeded"
+    return sections
 
 
 # Markdown cards written by fetch.py have this structure:
@@ -169,15 +194,24 @@ def main() -> None:
             fetch_state = entry["fetch_state"]
             paths = entry["paths"]
             sections = future.result()
-            fetch_state["pdf_text"] = (
-                "failed" if sections.get("extraction_status") == "failed" else "succeeded"
-            )
             output_path = output_dir / f"{project.safe_doi(doi)}.json"
             output_path.write_text(
                 json.dumps(sections, ensure_ascii=False, indent=2),
                 encoding="utf-8",
             )
-            paths["pdf_text"] = project.to_rel(output_path)
+            # plan v3 C19: text from the OCR rung is recorded as `ocr` (honest
+            # grounding label), NOT as born-digital pdf_text. refs.grounding then
+            # reports "ocr"; pdf_text stays skipped because PyMuPDF found nothing.
+            if sections.get("ocr_used"):
+                fetch_state["ocr"] = "succeeded"
+                paths["ocr"] = project.to_rel(output_path)
+                fetch_state["pdf_text"] = "skipped"
+                paths["pdf_text"] = None
+            else:
+                fetch_state["pdf_text"] = (
+                    "failed" if sections.get("extraction_status") == "failed" else "succeeded"
+                )
+                paths["pdf_text"] = project.to_rel(output_path)
             processed += 1
 
             # Splice intro/conclusion into the markdown card so prose authors

@@ -9,13 +9,17 @@ term_check_overrides:
   require_rct_or_meta: true
   require_primary_evidence_per_gap: 1
 default_search_sources: [crossref, semantic_scholar]
+protocol_defaults:
+  inclusion: "人体研究：系统综述/meta、RCT、大型前瞻队列、临床指南与共识；英文为主；近 10–15 年优先，奠基性研究不限年代"
+  exclusion: "纯动物/体外机制研究（仅在缺人体证据时作机制支撑）、无对照个案、未标注的预印本"
+  outcomes: "以临床/功能结局为准（疗效、风险、剂量反应；硬终点优先于替代指标）"
 ---
 
 # 主题补丁 — 人体健康 / 医学 / 营养 / 运动
 
 适用于一切以**人**为研究对象的循证综述：生理 / 生化、临床、营养学、运动科学、公共卫生。本补丁是项目的**默认基线**——CLAUDE.md 的通用工作流就是按人类临床循证调校的，本文件把那套默认的「证据分级 / 大队列阈值 / 缩写习惯 / 已知局限」**显式化并集中到一处**，让健康与其它领域在补丁表里对称。其它领域（animals / physics / …）的补丁是对本基线的 species/discipline 覆盖。
 
-> **frontmatter 说明**：本文件的 frontmatter 与 `tools/lib/patches.py` 的 `DEFAULT_PATCH` 逐字等价——它就是代码里那份默认配置的人类可读副本。`term_check` 读到 `require_rct_or_meta: true`（健康域保留「每个 decision/comparison 型 gap ≥1 条 RCT/meta」闸门）。改这里要同步改 `DEFAULT_PATCH`，反之亦然。
+> **frontmatter 说明**：本文件的 frontmatter 与 `scripts/lib/patches.py` 的 `DEFAULT_PATCH` 逐字等价——它就是代码里那份默认配置的人类可读副本。`term_check` 读到 `require_rct_or_meta: true`（健康域保留「每个 decision/comparison 型 gap ≥1 条 RCT/meta」闸门）。改这里要同步改 `DEFAULT_PATCH`，反之亦然。
 
 **已实证可用** — 参见：
 

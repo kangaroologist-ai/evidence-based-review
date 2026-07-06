@@ -8,8 +8,8 @@ number of citations to that gap from the review body.
 Read-only; no side effects.
 
 CLI:
-    python scripts/gaps_status.py reviews/<topic>
-    python scripts/gaps_status.py reviews/<topic> --gap gap-1
+    python tools/gaps_status.py reviews/<topic>
+    python tools/gaps_status.py reviews/<topic> --gap gap-1
 """
 from __future__ import annotations
 
@@ -20,7 +20,7 @@ import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).parent))
 
-from lib import config, project, testflight
+from lib import config, testflight
 from lib.citation_scan import scan_used_keys
 import refs
 
@@ -151,6 +151,16 @@ def _print_gap(
         print(f"  subgap_of: {subgap_of}")
     if depends_on:
         print(f"  depends_on: {', '.join(depends_on)}")
+    # C16 (m2): show the persisted search query + relevance-gate terms so the operator
+    # can see (and tune) what drives this gap's round expansion without grepping the store.
+    query = gap_meta.get("query")
+    relevance_terms = gap_meta.get("relevance_terms")
+    if isinstance(query, str) and query.strip():
+        print(f"  query: {query.strip()}")
+    if relevance_terms:
+        rt = relevance_terms if isinstance(relevance_terms, str) else ", ".join(relevance_terms)
+        if rt.strip():
+            print(f"  relevance_terms: {rt.strip()}")
     if fields:
         # Print structured sub-fields one per line, sorted for stable output.
         # Booleans (prevalence_subtag) come out as 'true'/'false'.
@@ -233,7 +243,7 @@ def main() -> None:
             print(f"[ERROR] no references store under {topic_dir}")
             raise SystemExit(1)
 
-        used_keys = _used_keys(project.review_path(topic_dir))
+        used_keys = _used_keys(topic_dir / "review.md")
         buckets = _bucket_entries(store)
         citations = _count_citations(store, used_keys)
         declared = set(store.get("gaps", {}).keys())

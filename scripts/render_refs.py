@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import collections
 import pathlib
+import re
 import sys
 from datetime import datetime
 
@@ -22,6 +23,12 @@ from lib.citation_scan import (
     REFS_MARK_RE as MARK_RE,
     strip_tool_managed_blocks as _strip_tool_managed_blocks,
 )
+
+# C13: a BARE `## References` heading the writer wrote WITHOUT the marker pair. The
+# block regex spans the heading to the next H2 / EOF so we replace it IN PLACE (never
+# "delete everything after References" — a §方法 or figure placed after it must survive).
+_BARE_REFS_HEAD_RE = re.compile(r"^##\s*References\b[^\n]*$", re.MULTILINE)
+_BARE_REFS_BLOCK_RE = re.compile(r"^##\s*References\b[^\n]*\n.*?(?=^##\s|\Z)", re.MULTILINE | re.DOTALL)
 
 
 def _author_family(author: str) -> str:
@@ -248,16 +255,25 @@ def _render(
     # block (or at EOF if References missing too).
     prisma_block = _prisma_flow_block(store, len(entries))
     if PRISMA_MARK_RE.search(review_text):
-        review_text = PRISMA_MARK_RE.sub(prisma_block, review_text)
+        review_text = PRISMA_MARK_RE.sub(lambda _m: prisma_block, review_text)
     elif MARK_RE.search(review_text):
         # Insert before the existing References marker pair.
-        review_text = MARK_RE.sub(prisma_block + "\n\n" + r"\g<0>", review_text)
+        review_text = MARK_RE.sub(lambda m: prisma_block + "\n\n" + m.group(0), review_text, count=1)
+    elif _BARE_REFS_HEAD_RE.search(review_text):
+        # C13: insert before a bare `## References` heading (no marker) so PRISMA
+        # stays in §方法 ABOVE References, not appended after it.
+        review_text = _BARE_REFS_HEAD_RE.sub(lambda m: prisma_block + "\n\n" + m.group(0), review_text, count=1)
     else:
         review_text = review_text.rstrip() + "\n\n" + prisma_block + "\n"
 
     block = _references_block(entries)
     if MARK_RE.search(review_text):
-        rendered_text = MARK_RE.sub(block, review_text)
+        rendered_text = MARK_RE.sub(lambda _m: block, review_text)
+    elif _BARE_REFS_BLOCK_RE.search(review_text):
+        # C13: a bare `## References` (no marker pair) → replace that section IN PLACE
+        # with the marker-wrapped block instead of appending a SECOND References at EOF.
+        # Bounded to the next H2 / EOF, so trailing §方法 / figures are preserved.
+        rendered_text = _BARE_REFS_BLOCK_RE.sub(lambda _m: block + "\n", review_text, count=1)
     else:
         rendered_text = review_text.rstrip() + "\n\n" + block + "\n"
     review_path.write_text(rendered_text, encoding="utf-8")

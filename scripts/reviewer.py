@@ -3,7 +3,7 @@
 Workflow (see docs/methodology_playbook.md §3 phase 7):
 
   1. After Phase 6 writes review.md, run:
-        python scripts/reviewer.py prompt reviews/<topic> --round 1
+        python tools/reviewer.py prompt reviews/<topic> --round 1
      Emits a shared prompt template to `reviewers/prompt_round_1.md`.
 
   2. Main thread spawns 3 INDEPENDENT Opus subagents (model: opus, same
@@ -11,7 +11,7 @@ Workflow (see docs/methodology_playbook.md §3 phase 7):
      to `reviewers/round_1_{1,2,3}.md`.
 
   3. Run:
-        python scripts/reviewer.py tally reviews/<topic> --round 1
+        python tools/reviewer.py tally reviews/<topic> --round 1
      Parses the 3 reviewer files and prints PASS (3/3 approve), REVISE
      (any request_changes — main thread fixes + bumps round), CONFIRM
      (at the round cap but every remaining FAIL is [mechanical] — run one
@@ -133,15 +133,18 @@ request_changes 都触发修订重审（最多 {max_rounds} 轮）。
 - 综述正文: `reviews/{topic}/review.md`
 - 已 verified entry list: `reviews/{topic}/references_store.json` + 单条 entry 在 `reviews/{topic}/references/*.json`
 - 已抓取的 abstract: 每条 entry 的 `paths.abstract` 字段指向 `tmp/{topic}/abstracts/<safe_doi>.md`
-- **必要时**调 `python scripts/fetch.py reviews/{topic} --include fulltext_xml --doi <DOI>` 拉关键引用的全文，核对 prose 是否扭曲原文
+- **必要时**调 `python tools/fetch.py reviews/{topic} --include fulltext_xml --doi <DOI>` 拉关键引用的全文，核对 prose 是否扭曲原文
+- **忠实度制品（spec §0.6 / W3）**：`reviews/{topic}/meta/faithfulness_report.md`（逐断言 verdict）+ `reviews/{topic}/meta/claim_evidence_map.md`（claim→span 溯源）。**全量忠实度由 faithfulness 工具保障，你是二次哨兵**——抽样高风险断言复核 + 审 report 内部一致性，**不逐条全核**。
 
 ## 检查 8 项（playbook §10 self-review checklist）
+
+> **分工（哨兵，W3）**：reviewer **1** 额外审 `faithfulness_report` 内部一致性（verdict 与 claim_evidence_map / abstract 是否自洽）+ 抽样高风险断言；reviewer **2/3** 走标准 8 项 + 各自抽样。第 7 项是**抽样**核（非全量；全量在 faithfulness 工具，reviewer 不背「零」）。
 
 对 review.md 全文逐项判断，每项给一行 `[PASS]` / `[FAIL]` + 简短说明：
 
 1. **章节标题是命题不是学科分类**——"§3 系统检索 = 多库 + snowballing + 图书馆员" PASS；"§3 文献检索" FAIL
 2. **每个数字带'这意味着什么'解释**——"recall ≈98%" 紧跟 "单库 MEDLINE 不足 80%" PASS；裸数据 / 没解释 FAIL
-3. **每观点 ≤3 cite，且每个 [@key] 解析到 verified entry**——多于 3 条 cite 单观点 → 列出位置
+3. **每观点 ≤5 cite（典型 1–3；只有真正不同类型/方向的强证据才到 5），且每个 [@key] 解析到 verified entry**——多于 5 条 cite 单观点 → 列出位置
 4. **矛盾呈现**——subagent 摘要识别的矛盾必须进 §限定与争议 或正文 prose 明示
 5. **限定节真写"这条阻止什么结论"**——不是"本综述局限在于..."礼貌收尾
 6. **cited verified ratio ≥ 50%**——若不达标主线程必须补 cite 或 prune entries
@@ -171,7 +174,7 @@ Verdict: request_changes
    不要"先报一个，等下一轮再报下一个"——那会把一篇综述的问题摊成多轮空跑。
 2. **每个 FAIL 必须紧跟一个严重度标签** `[mechanical]` 或 `[substantive]`：
    - `[mechanical]`：lint 可机械判定的——缺中文译名、`[@key]` 能否解析、
-     §章节是否齐全、PRISMA flow / References 节是否存在、cite 数是否 ≤3。
+     §章节是否齐全、PRISMA flow / References 节是否存在、cite 数是否 ≤5。
    - `[substantive]`：需要人类判断的——证据用错 / 数字与原文不符、矛盾漏呈现、
      prose 扭曲原文、限定节没说清"这条阻止什么结论"。
    标签写在 `[FAIL]` 之后、说明之前。机械类问题会在确认轮快速清零、不计入
@@ -180,7 +183,7 @@ Verdict: request_changes
 ```
 1. [PASS] 章节标题均为命题（§1–§8）
 2. [FAIL] [mechanical] §3 第 2 段 "recall 87.1%" 无解释；§5 第 3 段 GRADE 等级数字裸出（共 2 处，已全列）
-3. [PASS] 每观点 ≤3 cite
+3. [PASS] 每观点 ≤5 cite
 4. [FAIL] [substantive] §10 §限定 未呈现 howard2022 vs kyriakoulis2016 的矛盾（subagent 摘要里有）
 5. [FAIL] [substantive] §11 §限定 仍是"本综述局限在于..."礼貌收尾
 6. [PASS] cited 118/198 = 59.6% ≥ 50%
@@ -232,8 +235,8 @@ _生成时间: {timestamp}_
 先按严重度标签分流上面的 FAIL 项（`[mechanical]` vs `[substantive]`）：
 
 - **`[mechanical]` 项**（缺中文 / `[@key]` 不解析 / 缺 § / 缺 PRISMA flow）：本不该走到 failure。
-  先 `python scripts/lint_review.py reviews/{topic}` 把整类机械问题清零，再用
-  `python scripts/reviewer.py prompt reviews/{topic} --round 4 --allow-confirmation-round`
+  先 `python tools/lint_review.py reviews/{topic}` 把整类机械问题清零，再用
+  `python tools/reviewer.py prompt reviews/{topic} --round 4 --allow-confirmation-round`
   跑一轮 0-新问题确认轮即可放行——机械类不计入实质修订预算。若 tally 仍把它们当
   failure，多半是 reviewer 漏标 `[substantive]/[mechanical]`（→ 回退到旧判定逻辑）。
 - **`[substantive]` 项且某 reviewer 反复揪同一项**：可能要求过严或 reviewer 误判。看 prose 是否真的违反 playbook 标准；如系误判，主线程在下一轮 prompt 加 1 句 clarification 再启动新一轮。
@@ -312,7 +315,7 @@ def cmd_prompt(
         )
         print(
             f"[ERROR] revision round {round_num} > max {MAX_REVISION_ROUNDS}; "
-            f"run `python scripts/reviewer.py failure-report {topic_dir}` and stop"
+            f"run `python tools/reviewer.py failure-report {topic_dir}` and stop"
             f"{extra}"
         )
         return 1
@@ -338,7 +341,7 @@ def cmd_prompt(
         f"in parallel, each with this prompt + a distinct reviewer number; each "
         f"writes its Verdict + 8-item checklist to "
         f"`reviewers/round_{round_num}_{{1..{REVIEWER_COUNT}}}.md`; then run "
-        f"`python scripts/reviewer.py tally {topic_dir} --round {round_num}`"
+        f"`python tools/reviewer.py tally {topic_dir} --round {round_num}`"
     )
     return 0
 
@@ -431,7 +434,7 @@ def cmd_tally(topic_dir: pathlib.Path, round_num: int) -> int:
                 f"FAIL is [mechanical] ({severity['mechanical']} item(s)) — not a "
                 "substantive deadlock. Fix the mechanical items (ideally clear the "
                 "whole class via lint_review.py BEFORE spawning), then run ONE "
-                "0-new-problem confirmation round: `python scripts/reviewer.py prompt "
+                "0-new-problem confirmation round: `python tools/reviewer.py prompt "
                 f"{topic_dir} --round {confirm_round} --allow-confirmation-round` and "
                 "spawn 3 fresh Opus reviewers. Mechanical rounds do NOT count toward "
                 f"the {MAX_REVISION_ROUNDS}-substantive-round failure budget."
@@ -446,7 +449,7 @@ def cmd_tally(topic_dir: pathlib.Path, round_num: int) -> int:
         )
         print(
             f"[FAIL] round {round_num} == max {MAX_REVISION_ROUNDS} but not 3/3 "
-            f"approve{sub_note}; run `python scripts/reviewer.py failure-report "
+            f"approve{sub_note}; run `python tools/reviewer.py failure-report "
             f"{topic_dir}` and stop for user input"
         )
         return 2
